@@ -7,6 +7,8 @@ import unittest
 import numpy as np
 import pytest
 from reagent.preprocessing.identify_types import CONTINUOUS
+
+# pyre-fixme[21]: Could not find `workflow`.
 from reagent.test.workflow.reagent_sql_test_base import ReagentSQLTestBase
 from reagent.workflow.identify_types_flow import identify_normalization_parameters
 from reagent.workflow.types import PreprocessingOptions, TableSpec
@@ -14,10 +16,12 @@ from reagent.workflow.types import PreprocessingOptions, TableSpec
 
 logger = logging.getLogger(__name__)
 
-SEED = 42
 NUM_ROWS = 10000
+COL_NAME = "states"
+TABLE_NAME = "test_table"
 
 
+# pyre-fixme[11]: Annotation `ReagentSQLTestBase` is not defined as a type.
 class TestPreprocessing(ReagentSQLTestBase):
     def setUp(self):
         super().setUp()
@@ -26,37 +30,35 @@ class TestPreprocessing(ReagentSQLTestBase):
     @pytest.mark.serial
     def test_preprocessing(self):
         distributions = {}
-        distributions["0"] = {"mean": 0, "stddev": 1, "size": (5,)}
-        distributions["1"] = {"mean": 4, "stddev": 3, "size": (3,)}
+        distributions["0"] = {"mean": 0, "stddev": 1}
+        distributions["1"] = {"mean": 4, "stddev": 3}
 
         def get_random_feature():
             return {
-                k: np.random.normal(
-                    loc=info["mean"], scale=info["stddev"], size=info["size"]
-                ).tolist()
+                k: np.random.normal(loc=info["mean"], scale=info["stddev"])
                 for k, info in distributions.items()
             }
 
         data = [(i, get_random_feature()) for i in range(NUM_ROWS)]
-        df = self.sc.parallelize(data).toDF(["i", "states"])
+        df = self.sc.parallelize(data).toDF(["i", COL_NAME])
         df.show()
 
-        table_name = "test_table"
-        df.createOrReplaceTempView(table_name)
+        df.createOrReplaceTempView(TABLE_NAME)
 
-        num_samples = NUM_ROWS / 10
+        num_samples = NUM_ROWS // 2
         preprocessing_options = PreprocessingOptions(num_samples=num_samples)
 
-        table_spec = TableSpec(table_name=table_name)
+        table_spec = TableSpec(table_name=TABLE_NAME)
 
         normalization_params = identify_normalization_parameters(
-            table_spec, "states", preprocessing_options, seed=SEED
+            table_spec, COL_NAME, preprocessing_options, seed=self.test_class_seed
         )
 
         logger.info(normalization_params)
         for k, info in distributions.items():
             logger.info(
-                f"Expect {k} to be normal with mean {info['mean']}, stddev {info['stddev']}"
+                f"Expect {k} to be normal with "
+                f"mean {info['mean']}, stddev {info['stddev']}."
             )
             assert normalization_params[k].feature_type == CONTINUOUS
             assert (

@@ -4,19 +4,20 @@ import dataclasses
 import logging
 from typing import Dict, NamedTuple, Optional, Tuple
 
+import torch
 from reagent.parameters import NormalizationData
+from reagent.publishers.union import ModelPublisher__Union
+from reagent.validators.union import ModelValidator__Union
 from reagent.workflow.env import get_workflow_id
 from reagent.workflow.model_managers.union import ModelManager__Union
-from reagent.workflow.publishers.union import ModelPublisher__Union
 from reagent.workflow.types import (
-    PublishingResult__Union,
+    ReaderOptions,
     RecurringPeriod,
+    ResourceOptions,
     RewardOptions,
     RLTrainingOutput,
     TableSpec,
-    ValidationResult__Union,
 )
-from reagent.workflow.validators.union import ModelValidator__Union
 
 
 logger = logging.getLogger(__name__)
@@ -26,12 +27,17 @@ def identify_and_train_network(
     input_table_spec: TableSpec,
     model: ModelManager__Union,
     num_epochs: int,
-    use_gpu: bool = True,
+    use_gpu: Optional[bool] = None,
     reward_options: Optional[RewardOptions] = None,
+    reader_options: Optional[ReaderOptions] = None,
+    resource_options: Optional[ResourceOptions] = None,
     warmstart_path: Optional[str] = None,
     validator: Optional[ModelValidator__Union] = None,
     publisher: Optional[ModelPublisher__Union] = None,
 ) -> RLTrainingOutput:
+    if use_gpu is None:
+        use_gpu: bool = torch.cuda.is_available()
+
     manager = model.value
     normalization_data_map = manager.run_feature_identification(input_table_spec)
 
@@ -42,6 +48,8 @@ def identify_and_train_network(
         num_epochs,
         use_gpu=use_gpu,
         reward_options=reward_options,
+        reader_options=reader_options,
+        resource_options=resource_options,
         warmstart_path=warmstart_path,
         validator=validator,
         publisher=publisher,
@@ -71,16 +79,17 @@ def get_sample_range(
             eval_sample_range=(0.0, 0.0),
         )
 
-    assert (
-        eval_table_sample and table_sample and eval_table_sample + table_sample <= 100
-    ), (
-        "calc_cpe_in_training is set to True. Please specify table_sample"
-        "(current={}) and eval_table_sample(current={}) such that"
-        "eval_table_sample + table_sample <= 100. In order to reliably calculate"
-        "CPE, eval_table_sample should not be too small.".format(
-            table_sample, eval_table_sample
-        )
+    error_msg = (
+        "calc_cpe_in_training is set to True. "
+        f"Please specify table_sample(current={table_sample}) and "
+        f"eval_table_sample(current={eval_table_sample}) such that "
+        "eval_table_sample + table_sample <= 100. "
+        "In order to reliably calculate CPE, eval_table_sample "
+        "should not be too small."
     )
+    assert table_sample is not None, error_msg
+    assert eval_table_sample is not None, error_msg
+    assert (eval_table_sample + table_sample) <= (100.0 + 1e-3), error_msg
 
     return TrainEvalSampleRanges(
         train_sample_range=(0.0, table_sample),
@@ -95,6 +104,8 @@ def query_and_train(
     num_epochs: int,
     use_gpu: bool,
     reward_options: Optional[RewardOptions] = None,
+    reader_options: Optional[ReaderOptions] = None,
+    resource_options: Optional[ResourceOptions] = None,
     warmstart_path: Optional[str] = None,
     validator: Optional[ModelValidator__Union] = None,
     publisher: Optional[ModelPublisher__Union] = None,
@@ -108,24 +119,23 @@ def query_and_train(
     logger.info("Starting query")
 
     reward_options = reward_options or RewardOptions()
+    reader_options = reader_options or ReaderOptions()
+    resource_options = resource_options or ResourceOptions()
     manager = model.value
 
-    sample_range_output = get_sample_range(
-        input_table_spec, manager.should_generate_eval_dataset
-    )
+    calc_cpe_in_training = manager.should_generate_eval_dataset
+    sample_range_output = get_sample_range(input_table_spec, calc_cpe_in_training)
     train_dataset = manager.query_data(
-        input_table_spec,
+        input_table_spec=input_table_spec,
         sample_range=sample_range_output.train_sample_range,
         reward_options=reward_options,
-        eval_dataset=False,
     )
     eval_dataset = None
-    if manager.should_generate_eval_dataset:
+    if calc_cpe_in_training:
         eval_dataset = manager.query_data(
-            input_table_spec,
+            input_table_spec=input_table_spec,
             sample_range=sample_range_output.eval_sample_range,
             reward_options=reward_options,
-            eval_dataset=True,
         )
 
     logger.info("Starting training")
@@ -133,12 +143,13 @@ def query_and_train(
         train_dataset,
         eval_dataset,
         normalization_data_map,
-        model,
         num_epochs,
         use_gpu,
         parent_workflow_id=parent_workflow_id,
         child_workflow_id=child_workflow_id,
         reward_options=reward_options,
+        reader_options=reader_options,
+        resource_options=resource_options,
         warmstart_path=warmstart_path,
     )
 

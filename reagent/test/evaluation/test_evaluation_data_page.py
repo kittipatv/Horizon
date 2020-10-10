@@ -11,7 +11,12 @@ import torch.nn as nn
 from reagent import types as rlt
 from reagent.evaluation.doubly_robust_estimator import DoublyRobustEstimator
 from reagent.evaluation.evaluation_data_page import EvaluationDataPage
-from reagent.models.seq2slate import Seq2SlateMode
+from reagent.evaluation.ope_adapter import OPEstimatorAdapter
+from reagent.model_utils.seq2slate_utils import Seq2SlateMode
+from reagent.ope.estimators.contextual_bandits_estimators import (
+    SwitchDREstimator,
+    SwitchEstimator,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -28,14 +33,13 @@ class FakeSeq2SlateRewardNetwork(nn.Module):
         src_seq: torch.Tensor,
         tgt_out_seq: torch.Tensor,
         src_src_mask: torch.Tensor,
-        slate_reward: torch.Tensor,
         tgt_out_idx: torch.Tensor,
     ):
         batch_size = state.shape[0]
         rewards = []
         for i in range(batch_size):
             rewards.append(self._forward(state[i], tgt_out_idx[i]))
-        return torch.tensor(rewards).float()
+        return torch.tensor(rewards).unsqueeze(1)
 
     def _forward(self, state: torch.Tensor, tgt_out_idx: torch.Tensor):
         if (state == torch.tensor([1.0, 0.0, 0.0])).all():
@@ -73,7 +77,9 @@ class FakeSeq2SlateTransformerNet(nn.Module):
             return rlt.RankingOutput(
                 ranked_tgt_out_idx=torch.tensor([[2, 3], [3, 2], [2, 3]]).long()
             )
-        return rlt.RankingOutput(log_probs=torch.log(torch.tensor([0.4, 0.3, 0.7])))
+        return rlt.RankingOutput(
+            log_probs=torch.log(torch.tensor([0.4, 0.3, 0.7]).unsqueeze(1))
+        )
 
 
 class TestEvaluationDataPage(unittest.TestCase):
@@ -130,17 +136,15 @@ class TestEvaluationDataPage(unittest.TestCase):
         src_seq = torch.eye(candidate_dim).repeat(batch_size, 1, 1)
         tgt_out_idx = torch.LongTensor([[3, 2], [3, 2], [3, 2]])
         tgt_out_seq = src_seq[
-            torch.arange(batch_size).repeat_interleave(tgt_seq_len),  # type: ignore
+            torch.arange(batch_size).repeat_interleave(tgt_seq_len),
             tgt_out_idx.flatten() - 2,
         ].reshape(batch_size, tgt_seq_len, candidate_dim)
 
         ptb = rlt.PreprocessedTrainingBatch(
             training_input=rlt.PreprocessedRankingInput(
-                state=rlt.PreprocessedFeatureVector(
-                    float_features=torch.eye(state_dim)
-                ),
-                src_seq=rlt.PreprocessedFeatureVector(float_features=src_seq),
-                tgt_out_seq=rlt.PreprocessedFeatureVector(float_features=tgt_out_seq),
+                state=rlt.FeatureData(float_features=torch.eye(state_dim)),
+                src_seq=rlt.FeatureData(float_features=src_seq),
+                tgt_out_seq=rlt.FeatureData(float_features=tgt_out_seq),
                 src_src_mask=torch.ones(batch_size, src_seq_len, src_seq_len),
                 tgt_out_idx=tgt_out_idx,
                 tgt_out_probs=torch.tensor([0.2, 0.5, 0.4]),
@@ -157,9 +161,25 @@ class TestEvaluationDataPage(unittest.TestCase):
         )
         logger.info("---------- Start evaluating eval_greedy=True -----------------")
         doubly_robust_estimator = DoublyRobustEstimator()
-        direct_method, inverse_propensity, doubly_robust = doubly_robust_estimator.estimate(
-            edp
+        (
+            direct_method,
+            inverse_propensity,
+            doubly_robust,
+        ) = doubly_robust_estimator.estimate(edp)
+        switch_estimator, switch_dr_estimator = (
+            OPEstimatorAdapter(SwitchEstimator()),
+            OPEstimatorAdapter(SwitchDREstimator()),
         )
+
+        # Verify that Switch with low exponent is equivalent to IPS
+        switch_ips = switch_estimator.estimate(edp, exp_base=1)
+        # Verify that Switch with no candidates is equivalent to DM
+        switch_dm = switch_estimator.estimate(edp, candidates=0)
+        # Verify that SwitchDR with low exponent is equivalent to DR
+        switch_dr_dr = switch_dr_estimator.estimate(edp, exp_base=1)
+        # Verify that SwitchDR with no candidates is equivalent to DM
+        switch_dr_dm = switch_dr_estimator.estimate(edp, candidates=0)
+
         logger.info(f"{direct_method}, {inverse_propensity}, {doubly_robust}")
 
         avg_logged_reward = (4 + 5 + 7) / 3
@@ -179,6 +199,10 @@ class TestEvaluationDataPage(unittest.TestCase):
         self.assertAlmostEqual(
             doubly_robust.normalized, doubly_robust.raw / avg_logged_reward, delta=1e-6
         )
+        self.assertAlmostEqual(switch_ips.raw, inverse_propensity.raw, delta=1e-6)
+        self.assertAlmostEqual(switch_dm.raw, direct_method.raw, delta=1e-6)
+        self.assertAlmostEqual(switch_dr_dr.raw, doubly_robust.raw, delta=1e-6)
+        self.assertAlmostEqual(switch_dr_dm.raw, direct_method.raw, delta=1e-6)
         logger.info("---------- Finish evaluating eval_greedy=True -----------------")
 
         logger.info("---------- Start evaluating eval_greedy=False -----------------")

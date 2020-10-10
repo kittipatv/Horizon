@@ -2,15 +2,15 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 
 import logging
-from typing import Dict, List, Tuple, cast
+from typing import Dict, List, Optional, Tuple, cast
 
 import torch
-from reagent.preprocessing.identify_types import ENUM, FEATURE_TYPES
+from reagent.parameters import NormalizationParameters
+from reagent.preprocessing.identify_types import DO_NOT_PREPROCESS, ENUM, FEATURE_TYPES
 from reagent.preprocessing.normalization import (
     EPS,
     MAX_FEATURE_VALUE,
     MIN_FEATURE_VALUE,
-    NormalizationParameters,
 )
 from torch.nn import Module, Parameter
 
@@ -22,50 +22,54 @@ class Preprocessor(Module):
     def __init__(
         self,
         normalization_parameters: Dict[int, NormalizationParameters],
-        use_gpu: bool,
+        use_gpu: Optional[bool] = None,
+        device: Optional[torch.device] = None,
     ) -> None:
         super().__init__()
         self.normalization_parameters = normalization_parameters
-        self.feature_id_to_index, self.sorted_features, self.sorted_feature_boundaries = (
-            self._sort_features_by_normalization()
-        )
+        (
+            self.feature_id_to_index,
+            self.sorted_features,
+            self.sorted_feature_boundaries,
+        ) = self._sort_features_by_normalization()
 
         cuda_available = torch.cuda.is_available()
         logger.info("CUDA availability: {}".format(cuda_available))
-        if use_gpu and cuda_available:
+        if device is not None:
+            self.device = device
+        elif use_gpu and cuda_available:
+            logger.warn("use_gpu is deprecated, please pass in the device directly")
             logger.info("Using GPU: GPU requested and available.")
-            self.use_gpu = True
-            self.dtype = torch.cuda.FloatTensor  # type: ignore
+            self.device = torch.device("cuda")
         else:
             logger.info("NOT Using GPU: GPU not requested or not available.")
-            self.use_gpu = False
-            self.dtype = torch.FloatTensor
+            self.device = torch.device("cpu")
 
         # NOTE: Because of the way we call AppendNet to squash ONNX to a C2 net,
         # We need to make tensors for every numeric literal
         self.zero_tensor = Parameter(
-            torch.tensor([0.0]).type(self.dtype), requires_grad=False
+            torch.tensor([0.0], device=self.device), requires_grad=False
         )
         self.one_tensor = Parameter(
-            torch.tensor([1.0]).type(self.dtype), requires_grad=False
+            torch.tensor([1.0], device=self.device), requires_grad=False
         )
         self.one_half_tensor = Parameter(
-            torch.tensor([0.5]).type(self.dtype), requires_grad=False
+            torch.tensor([0.5], device=self.device), requires_grad=False
         )
         self.one_hundredth_tensor = Parameter(
-            torch.tensor([0.01]).type(self.dtype), requires_grad=False
+            torch.tensor([0.01], device=self.device), requires_grad=False
         )
         self.negative_one_tensor = Parameter(
-            torch.tensor([-1.0]).type(self.dtype), requires_grad=False
+            torch.tensor([-1.0], device=self.device), requires_grad=False
         )
         self.min_tensor = Parameter(
-            torch.tensor([-1e20]).type(self.dtype), requires_grad=False
+            torch.tensor([-1e20], device=self.device), requires_grad=False
         )
         self.max_tensor = Parameter(
-            torch.tensor([1e20]).type(self.dtype), requires_grad=False
+            torch.tensor([1e20], device=self.device), requires_grad=False
         )
         self.epsilon_tensor = Parameter(
-            torch.tensor([EPS]).type(self.dtype), requires_grad=False
+            torch.tensor([EPS], device=self.device), requires_grad=False
         )
 
         self.feature_starts = self._get_type_boundaries()
@@ -97,8 +101,13 @@ class Preprocessor(Module):
 
     def input_prototype(self) -> Tuple[torch.Tensor, torch.Tensor]:
         return (
-            torch.randn(1, len(self.normalization_parameters)),
-            torch.ones(1, len(self.normalization_parameters), dtype=torch.uint8),
+            torch.randn(1, len(self.normalization_parameters), device=self.device),
+            torch.ones(
+                1,
+                len(self.normalization_parameters),
+                dtype=torch.uint8,
+                device=self.device,
+            ),
         )
 
     def forward(
@@ -107,6 +116,9 @@ class Preprocessor(Module):
         """ Preprocess the input matrix
         :param input tensor
         """
+        assert (
+            input.shape == input_presence_byte.shape
+        ), f"{input.shape} != {input_presence_byte.shape}"
         outputs = []
         split_input = torch.split(input, self.split_sections, dim=1)
         # NB: converting to float prevent ASAN heap-buffer-overflow
@@ -147,20 +159,13 @@ class Preprocessor(Module):
                 )
                 ptr += 1
                 self._check_preprocessing_output(new_output, norm_params_list)
+                if feature_type != DO_NOT_PREPROCESS:
+                    new_output = torch.clamp(
+                        new_output, MIN_FEATURE_VALUE, MAX_FEATURE_VALUE
+                    )
                 outputs.append(new_output)
 
-        if len(outputs) == 1:
-            return cast(
-                torch.Tensor,
-                torch.clamp(outputs[0], MIN_FEATURE_VALUE, MAX_FEATURE_VALUE),
-            )
-
-        return cast(
-            torch.Tensor,
-            torch.clamp(
-                torch.cat(outputs, dim=1), MIN_FEATURE_VALUE, MAX_FEATURE_VALUE
-            ),
-        )
+        return torch.cat(outputs, dim=1)
 
     def _preprocess_feature_single_column(
         self,
@@ -170,7 +175,7 @@ class Preprocessor(Module):
     ) -> torch.Tensor:
         feature_type = norm_params.feature_type
         func = getattr(self, "_preprocess_" + feature_type)
-        return func(begin_index, input, norm_params)  # type: ignore
+        return func(begin_index, input, norm_params)
 
     def _preprocess_feature_multi_column(
         self,
@@ -180,7 +185,7 @@ class Preprocessor(Module):
     ) -> torch.Tensor:
         feature_type = norm_params[0].feature_type
         func = getattr(self, "_preprocess_" + feature_type)
-        return func(begin_index, input, norm_params)  # type: ignore
+        return func(begin_index, input, norm_params)
 
     def _create_parameters_DO_NOT_PREPROCESS(
         self, begin_index: int, norm_params: List[NormalizationParameters]
@@ -221,8 +226,8 @@ class Preprocessor(Module):
         norm_params: List[NormalizationParameters],
     ) -> torch.Tensor:
         clamped_input = torch.clamp(input, 0.01, 0.99)
-        return self.negative_one_tensor * (  # type: ignore
-            ((self.one_tensor / clamped_input) - self.one_tensor).log()  # type: ignore
+        return self.negative_one_tensor * (
+            ((self.one_tensor / clamped_input) - self.one_tensor).log()
         )
 
     def _create_parameters_CONTINUOUS_ACTION(
@@ -231,22 +236,23 @@ class Preprocessor(Module):
         self._create_parameter(
             begin_index,
             "min_serving_value",
-            torch.Tensor([p.min_value for p in norm_params]).type(self.dtype),
+            torch.tensor([p.min_value for p in norm_params], device=self.device),
         )
         self._create_parameter(
             begin_index,
             "min_training_value",
-            torch.ones(len(norm_params)).type(self.dtype) * -1 + EPS,
+            torch.ones(len(norm_params), device=self.device) * -1 + EPS,
         )
         self._create_parameter(
             begin_index,
             "scaling_factor",
-            (torch.ones(len(norm_params)).type(self.dtype) - EPS)
+            (torch.ones(len(norm_params), device=self.device) - EPS)
             * 2
             / torch.tensor(
-                [p.max_value - p.min_value for p in norm_params]  # type: ignore
-            ).type(  # type: ignore
-                self.dtype
+                # pyre-fixme[58]: `-` is not supported for operand types
+                #  `Optional[float]` and `Optional[float]`.
+                [p.max_value - p.min_value for p in norm_params],
+                device=self.device,
             ),
         )
 
@@ -262,7 +268,7 @@ class Preprocessor(Module):
         continuous_action = (
             input - min_serving_value
         ) * scaling_factor + min_training_value
-        return torch.clamp(continuous_action, -1 + EPS, 1 - EPS)  # type: ignore
+        return torch.clamp(continuous_action, -1 + EPS, 1 - EPS)
 
     def _create_parameters_CONTINUOUS(
         self, begin_index: int, norm_params: List[NormalizationParameters]
@@ -270,12 +276,12 @@ class Preprocessor(Module):
         self._create_parameter(
             begin_index,
             "means",
-            torch.Tensor([p.mean for p in norm_params]).type(self.dtype),
+            torch.tensor([p.mean for p in norm_params], device=self.device),
         )
         self._create_parameter(
             begin_index,
             "stddevs",
-            torch.Tensor([p.stddev for p in norm_params]).type(self.dtype),
+            torch.tensor([p.stddev for p in norm_params], device=self.device),
         )
 
     def _preprocess_CONTINUOUS(
@@ -295,16 +301,18 @@ class Preprocessor(Module):
         self._create_parameter(
             begin_index,
             "shifts",
-            torch.Tensor([p.boxcox_shift for p in norm_params]).type(self.dtype),
+            torch.tensor([p.boxcox_shift for p in norm_params], device=self.device),
         )
         for p in norm_params:
             assert (
-                abs(p.boxcox_lambda) > 1e-6  # type: ignore
+                # pyre-fixme[16]: `Optional` has no attribute `__abs__`.
+                abs(p.boxcox_lambda)
+                > 1e-6
             ), "Invalid value for boxcox lambda: " + str(p.boxcox_lambda)
         self._create_parameter(
             begin_index,
             "lambdas",
-            torch.Tensor([p.boxcox_lambda for p in norm_params]).type(self.dtype),
+            torch.tensor([p.boxcox_lambda for p in norm_params], device=self.device),
         )
         self._create_parameters_CONTINUOUS(begin_index, norm_params)
 
@@ -334,14 +342,19 @@ class Preprocessor(Module):
         F = len(norm_params)
 
         num_quantiles = torch.tensor(
-            [[float(len(p.quantiles)) - 1 for p in norm_params]]  # type: ignore
-        ).type(self.dtype)
+            # pyre-fixme[6]: Expected `Sized` for 1st param but got
+            #  `Optional[List[float]]`.
+            [[float(len(p.quantiles)) - 1 for p in norm_params]],
+            device=self.device,
+        )
         self._create_parameter(begin_index, "num_quantiles", num_quantiles)
 
         max_num_quantile_boundaries = int(
             torch.max(
-                torch.tensor([len(p.quantiles) for p in norm_params])  # type: ignore
-            ).item()  # type: ignore
+                # pyre-fixme[6]: Expected `Sized` for 1st param but got
+                #  `Optional[List[float]]`.
+                torch.tensor([len(p.quantiles) for p in norm_params])
+            ).item()
         )
         B = max_num_quantile_boundaries
 
@@ -353,25 +366,30 @@ class Preprocessor(Module):
 
         # We project the quantiles boundaries to 3d and create a 1xFxB tensor
         quantile_boundaries = torch.zeros(
-            [1, len(norm_params), max_num_quantile_boundaries]
-        ).type(self.dtype)
-        max_quantile_boundaries = torch.zeros([1, len(norm_params)]).type(self.dtype)
-        min_quantile_boundaries = torch.zeros([1, len(norm_params)]).type(self.dtype)
+            [1, len(norm_params), max_num_quantile_boundaries], device=self.device
+        )
+        max_quantile_boundaries = torch.zeros([1, len(norm_params)], device=self.device)
+        min_quantile_boundaries = torch.zeros([1, len(norm_params)], device=self.device)
         for i, p in enumerate(norm_params):
-            quantile_boundaries[0, i, :] = p.quantiles[-1]  # type: ignore
+            # pyre-fixme[16]: `Optional` has no attribute `__getitem__`.
+            quantile_boundaries[0, i, :] = p.quantiles[-1]
             quantile_boundaries[
-                0, i, 0 : len(p.quantiles)  # type: ignore
-            ] = torch.tensor(  # type: ignore
-                p.quantiles
-            ).type(
-                self.dtype
-            )
-            max_quantile_boundaries[0, i] = max(p.quantiles)  # type: ignore
-            min_quantile_boundaries[0, i] = min(p.quantiles)  # type: ignore
+                0,
+                i,
+                # pyre-fixme[6]: Expected `Sized` for 1st param but got
+                #  `Optional[List[float]]`.
+                0 : len(p.quantiles),
+            ] = torch.tensor(p.quantiles, device=self.device)
+            # pyre-fixme[6]: Expected `Iterable[Variable[_T]]` for 1st param but got
+            #  `Optional[List[float]]`.
+            max_quantile_boundaries[0, i] = max(p.quantiles)
+            # pyre-fixme[6]: Expected `Iterable[Variable[_T]]` for 1st param but got
+            #  `Optional[List[float]]`.
+            min_quantile_boundaries[0, i] = min(p.quantiles)
 
-        quantile_boundaries = quantile_boundaries.type(self.dtype)
-        max_quantile_boundaries = max_quantile_boundaries.type(self.dtype)
-        min_quantile_boundaries = min_quantile_boundaries.type(self.dtype)
+        quantile_boundaries = quantile_boundaries.to(self.device)
+        max_quantile_boundaries = max_quantile_boundaries.to(self.device)
+        min_quantile_boundaries = min_quantile_boundaries.to(self.device)
 
         self._create_parameter(begin_index, "quantile_boundaries", quantile_boundaries)
         self._create_parameter(
@@ -383,7 +401,7 @@ class Preprocessor(Module):
         self._create_parameter(
             begin_index,
             "quantile_boundary_mask",
-            torch.ones([1, F, B]).type(self.dtype),
+            torch.ones([1, F, B], device=self.device),
         )
 
     def _preprocess_QUANTILE(
@@ -465,7 +483,9 @@ class Preprocessor(Module):
         self._create_parameter(
             begin_index,
             "enum_values",
-            torch.Tensor(norm_params.possible_values).unsqueeze(0).type(self.dtype),
+            torch.tensor(
+                norm_params.possible_values, device=self.device, dtype=torch.float
+            ).unsqueeze(0),
         )
 
     def _preprocess_ENUM(
@@ -537,18 +557,16 @@ class Preprocessor(Module):
         feature_type = norm_params[0].feature_type
         min_value, max_value = batch.min(), batch.max()
 
-        if feature_type in ("BOXCOX", "CONTINUOUS"):
+        if feature_type in ("BOXCOX", "CONTINUOUS", "DO_NOT_PREPROCESS"):
             # Continuous features may be in range (-inf, inf)
             pass
-        elif max_value.gt(MAX_FEATURE_VALUE):
+        elif max_value.item() > MAX_FEATURE_VALUE:
             raise Exception(
-                "A {} feature type has max value {} which is > than accepted post pre-processing max of {}".format(
-                    feature_type, max_value, MAX_FEATURE_VALUE
-                )
+                f"A {feature_type} feature type has max value {max_value} which is >"
+                f" than accepted post pre-processing max of {MAX_FEATURE_VALUE}"
             )
-        elif min_value.lt(MIN_FEATURE_VALUE):
+        elif min_value.item() < MIN_FEATURE_VALUE:
             raise Exception(
-                "A {} feature type has min value {} which is < accepted post pre-processing min of {}".format(
-                    feature_type, min_value, MIN_FEATURE_VALUE
-                )
+                f"A {feature_type} feature type has min value {min_value} which is <"
+                f" accepted post pre-processing min of {MIN_FEATURE_VALUE}"
             )

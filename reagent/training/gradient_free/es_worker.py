@@ -9,6 +9,8 @@ import torch.nn
 import torch.optim
 from reagent.parameters import EvolutionParameters
 from reagent.training.gradient_free.evolution_pool import EvolutionPool
+
+# pyre-fixme[21]: Could not find name `ProcessGroup` in `torch.distributed`.
 from torch.distributed import ProcessGroup
 
 
@@ -20,6 +22,7 @@ class EsWorker:
         self,
         individual_pool: EvolutionPool,
         es_params: EvolutionParameters,
+        # pyre-fixme[11]: Annotation `ProcessGroup` is not defined as a type.
         process_group: ProcessGroup,
         num_nodes: int,
     ) -> None:

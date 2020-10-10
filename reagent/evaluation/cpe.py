@@ -30,6 +30,9 @@ class CpeEstimateSet(NamedTuple):
     weighted_doubly_robust: Optional[CpeEstimate] = None
     magic: Optional[CpeEstimate] = None
 
+    switch: Optional[CpeEstimate] = None
+    switch_dr: Optional[CpeEstimate] = None
+
     def check_estimates_exist(self):
         assert self.direct_method is not None
         assert self.inverse_propensity is not None
@@ -104,26 +107,28 @@ class CpeEstimateSet(NamedTuple):
         for name, value in [
             (
                 "CPE/{}/Direct_Method_Reward".format(metric_name),
-                self.direct_method.normalized,  # type: ignore
+                # pyre-fixme[16]: `Optional` has no attribute `normalized`.
+                self.direct_method.normalized,
             ),
             (
                 "CPE/{}/IPS_Reward".format(metric_name),
-                self.inverse_propensity.normalized,  # type: ignore
+                self.inverse_propensity.normalized,
             ),
             (
                 "CPE/{}/Doubly_Robust_Reward".format(metric_name),
-                self.doubly_robust.normalized,  # type: ignore
+                self.doubly_robust.normalized,
             ),
             (
                 "CPE/{}/Sequential_Doubly_Robust".format(metric_name),
-                self.sequential_doubly_robust.normalized,  # type: ignore
+                self.sequential_doubly_robust.normalized,
             ),
             (
                 "CPE/{}/Weighted_Sequential_Doubly_Robust".format(metric_name),
-                self.weighted_doubly_robust.normalized,  # type: ignore
+                self.weighted_doubly_robust.normalized,
             ),
-            ("CPE/{}/MAGIC".format(metric_name), self.magic.normalized),  # type: ignore
+            ("CPE/{}/MAGIC".format(metric_name), self.magic.normalized),
         ]:
+            # pyre-fixme[16]: `SummaryWriterContext` has no attribute `add_scalar`.
             SummaryWriterContext.add_scalar(name, none_to_zero(value))
 
     def fill_empty_with_zero(self):

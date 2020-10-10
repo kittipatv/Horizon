@@ -6,15 +6,26 @@ from typing import Dict, List, Optional, Tuple
 from reagent import types as rlt
 from reagent.core.dataclasses import dataclass, field
 from reagent.evaluation.evaluator import Evaluator, get_metrics_to_score
+from reagent.gym.policies.policy import Policy
+from reagent.gym.policies.predictor_policies import create_predictor_policy_from_model
+from reagent.gym.policies.samplers.discrete_sampler import SoftmaxActionSampler
+from reagent.gym.policies.scorers.discrete_scorer import discrete_dqn_scorer
 from reagent.models.base import ModelBase
-from reagent.parameters import NormalizationData
-from reagent.preprocessing.batch_preprocessor import BatchPreprocessor
+from reagent.models.model_feature_config_provider import RawModelFeatureConfigProvider
+from reagent.parameters import EvaluationParameters, NormalizationData, NormalizationKey
+from reagent.preprocessing.batch_preprocessor import (
+    BatchPreprocessor,
+    DiscreteDqnBatchPreprocessor,
+)
+from reagent.preprocessing.preprocessor import Preprocessor
+from reagent.preprocessing.types import InputColumn
 from reagent.workflow.data_fetcher import query_data
 from reagent.workflow.identify_types_flow import identify_normalization_parameters
 from reagent.workflow.model_managers.model_manager import ModelManager
 from reagent.workflow.reporters.discrete_dqn_reporter import DiscreteDQNReporter
 from reagent.workflow.types import (
     Dataset,
+    ModelFeatureConfigProvider__Union,
     PreprocessingOptions,
     ReaderOptions,
     RewardOptions,
@@ -23,42 +34,53 @@ from reagent.workflow.types import (
     TableSpec,
 )
 from reagent.workflow.utils import train_and_evaluate_generic
-from reagent.workflow_utils.page_handler import (
-    EvaluationPageHandler,
-    TrainingPageHandler,
-)
 
 
 logger = logging.getLogger(__name__)
 
 
-class DiscreteNormalizationParameterKeys:
-    STATE = "state"
-
-
 @dataclass
 class DiscreteDQNBase(ModelManager):
     target_action_distribution: Optional[List[float]] = None
-    state_feature_config: rlt.ModelFeatureConfig = field(
-        default_factory=lambda: rlt.ModelFeatureConfig(float_feature_infos=[])
+    state_feature_config_provider: ModelFeatureConfigProvider__Union = field(
+        # pyre-fixme[28]: Unexpected keyword argument `raw`.
+        # pyre-fixme[28]: Unexpected keyword argument `raw`.
+        default_factory=lambda: ModelFeatureConfigProvider__Union(
+            raw=RawModelFeatureConfigProvider(float_feature_infos=[])
+        )
     )
     preprocessing_options: Optional[PreprocessingOptions] = None
     reader_options: Optional[ReaderOptions] = None
+    eval_parameters: EvaluationParameters = field(default_factory=EvaluationParameters)
 
     def __post_init_post_parse__(self):
         super().__init__()
         self._metrics_to_score = None
         self._q_network: Optional[ModelBase] = None
 
-    @classmethod
-    def normalization_key(cls) -> str:
-        return DiscreteNormalizationParameterKeys.STATE
+    def create_policy(self, serving: bool) -> Policy:
+        """ Create an online DiscreteDQN Policy from env. """
+        if serving:
+            return create_predictor_policy_from_model(self.build_serving_module())
+        else:
+            sampler = SoftmaxActionSampler(temperature=self.rl_parameters.temperature)
+            # pyre-fixme[16]: `RLTrainer` has no attribute `q_network`.
+            scorer = discrete_dqn_scorer(self.trainer.q_network)
+            return Policy(scorer=scorer, sampler=sampler)
+
+    @property
+    def state_feature_config(self) -> rlt.ModelFeatureConfig:
+        return self.state_feature_config_provider.value.get_model_feature_config()
 
     @property
     def metrics_to_score(self) -> List[str]:
-        assert self.reward_options is not None
+        assert self._reward_options is not None
         if self._metrics_to_score is None:
+            # pyre-fixme[16]: `DiscreteDQNBase` has no attribute `_metrics_to_score`.
+            # pyre-fixme[16]: `DiscreteDQNBase` has no attribute `_metrics_to_score`.
             self._metrics_to_score = get_metrics_to_score(
+                # pyre-fixme[16]: `Optional` has no attribute `metric_reward_values`.
+                # pyre-fixme[16]: `Optional` has no attribute `metric_reward_values`.
                 self._reward_options.metric_reward_values
             )
         return self._metrics_to_score
@@ -67,18 +89,9 @@ class DiscreteDQNBase(ModelManager):
     def should_generate_eval_dataset(self) -> bool:
         return self.eval_parameters.calc_cpe_in_training
 
-    def _set_normalization_parameters(
-        self, normalization_data_map: Dict[str, NormalizationData]
-    ):
-        """
-        Set normalization parameters on current instance
-        """
-        state_norm_data = normalization_data_map.get(self.normalization_key(), None)
-        assert state_norm_data is not None
-        assert state_norm_data.dense_normalization_parameters is not None
-        self.state_normalization_parameters = (
-            state_norm_data.dense_normalization_parameters
-        )
+    @property
+    def required_normalization_keys(self) -> List[str]:
+        return [NormalizationKey.STATE]
 
     def run_feature_identification(
         self, input_table_spec: TableSpec
@@ -91,13 +104,11 @@ class DiscreteDQNBase(ModelManager):
         preprocessing_options = preprocessing_options._replace(
             whitelist_features=state_features
         )
-
-        state_normalization_parameters = identify_normalization_parameters(
-            input_table_spec, "state_features", preprocessing_options
-        )
         return {
-            DiscreteNormalizationParameterKeys.STATE: NormalizationData(
-                dense_normalization_parameters=state_normalization_parameters
+            NormalizationKey.STATE: NormalizationData(
+                dense_normalization_parameters=identify_normalization_parameters(
+                    input_table_spec, InputColumn.STATE_FEATURES, preprocessing_options
+                )
             )
         }
 
@@ -106,20 +117,16 @@ class DiscreteDQNBase(ModelManager):
         input_table_spec: TableSpec,
         sample_range: Optional[Tuple[float, float]],
         reward_options: RewardOptions,
-        eval_dataset: bool,
     ) -> Dataset:
-        # sort is set to False because EvaluationPageHandler sort the data anyway
         return query_data(
-            input_table_spec,
-            self.action_names,
-            self.rl_parameters.use_seq_num_diff_as_time_diff,
+            input_table_spec=input_table_spec,
+            discrete_action=True,
+            actions=self.action_names,
+            include_possible_actions=True,
             sample_range=sample_range,
-            metric_reward_values=reward_options.metric_reward_values,
             custom_reward_expression=reward_options.custom_reward_expression,
-            additional_reward_expression=reward_options.additional_reward_expression,
             multi_steps=self.multi_steps,
             gamma=self.rl_parameters.gamma,
-            sort=False,
         )
 
     @property
@@ -127,55 +134,61 @@ class DiscreteDQNBase(ModelManager):
         return self.rl_parameters.multi_steps
 
     def build_batch_preprocessor(self) -> BatchPreprocessor:
-        raise NotImplementedError
+        state_preprocessor = Preprocessor(
+            self.state_normalization_data.dense_normalization_parameters,
+            use_gpu=self.use_gpu,
+        )
+        return DiscreteDqnBatchPreprocessor(
+            num_actions=len(self.action_names),
+            state_preprocessor=state_preprocessor,
+            use_gpu=self.use_gpu,
+        )
 
     def train(
-        self, train_dataset: Dataset, eval_dataset: Optional[Dataset], num_epochs: int
+        self,
+        train_dataset: Dataset,
+        eval_dataset: Optional[Dataset],
+        num_epochs: int,
+        reader_options: ReaderOptions,
     ) -> RLTrainingOutput:
         """
         Train the model
 
-        Returns partially filled RLTrainningOutput. The field that should not be filled
-        are:
+        Returns partially filled RLTrainingOutput.
+        The field that should not be filled are:
         - output_path
-        - warmstart_output_path
-        - vis_metrics
-        - validation_output
         """
-        logger.info("Creating reporter")
         reporter = DiscreteDQNReporter(
             self.trainer_param.actions,
             target_action_distribution=self.target_action_distribution,
         )
-        logger.info("Adding reporter to trainer")
+        # pyre-fixme[16]: `RLTrainer` has no attribute `add_observer`.
         self.trainer.add_observer(reporter)
 
-        training_page_handler = TrainingPageHandler(self.trainer)
-        training_page_handler.add_observer(reporter)
         evaluator = Evaluator(
             self.action_names,
             self.rl_parameters.gamma,
             self.trainer,
             metrics_to_score=self.metrics_to_score,
         )
-        logger.info("Adding reporter to evaluator")
+        # pyre-fixme[16]: `Evaluator` has no attribute `add_observer`.
         evaluator.add_observer(reporter)
-        evaluation_page_handler = EvaluationPageHandler(
-            self.trainer, evaluator, reporter
-        )
 
         batch_preprocessor = self.build_batch_preprocessor()
         train_and_evaluate_generic(
             train_dataset,
             eval_dataset,
+            # pyre-fixme[6]: Expected `RLTrainer` for 3rd param but got `Trainer`.
+            # pyre-fixme[6]: Expected `RLTrainer` for 3rd param but got `Trainer`.
             self.trainer,
             num_epochs,
             self.use_gpu,
             batch_preprocessor,
-            training_page_handler,
-            evaluation_page_handler,
+            reporter,
+            evaluator,
             reader_options=self.reader_options,
         )
+        # pyre-fixme[16]: `RLTrainingReport` has no attribute `make_union_instance`.
         training_report = RLTrainingReport.make_union_instance(
             reporter.generate_training_report()
         )

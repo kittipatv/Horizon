@@ -20,10 +20,11 @@ import torch.nn as nn
 from reagent import types as rlt
 from reagent.models.base import ModelBase
 from reagent.models.world_model import MemoryNetwork
+from reagent.parameters import CONTINUOUS_TRAINING_ACTION_RANGE
+from reagent.training.utils import rescale_actions
 from torch.distributions.bernoulli import Bernoulli
 from torch.distributions.categorical import Categorical
 from torch.distributions.normal import Normal
-from torch.nn.parallel.distributed import DistributedDataParallel
 
 
 logger = logging.getLogger(__name__)
@@ -50,18 +51,24 @@ class CEMPlannerNetwork(nn.Module):
     ):
         """
         :param mem_net_list: A list of world models used to simulate trajectories
-        :param cem_num_iterations: The maximum number of iterations for searching the best action
-        :param cem_population_size: The number of candidate solutions to evaluate in each CEM iteration
-        :param ensemble_population_size: The number of trajectories to be sampled to evaluate a CEM solution
-        :param num_elites: The number of elites kept to refine solutions in each iteration
+        :param cem_num_iterations: The maximum number of iterations for
+            searching the best action
+        :param cem_population_size: The number of candidate solutions to
+            evaluate in each CEM iteration
+        :param ensemble_population_size: The number of trajectories to be
+            sampled to evaluate a CEM solution
+        :param num_elites: The number of elites kept to refine solutions
+            in each iteration
         :param plan_horizon_length: The number of steps to plan ahead
         :param state_dim: state dimension
         :param action_dim: action dimension
         :param discrete_action: If actions are discrete or continuous
-        :param terminal_effective: If False, planning will stop after a predicted terminal signal
+        :param terminal_effective: If False, planning will stop after a
+            predicted terminal signal
         :param gamma: The reward discount factor
         :param alpha: The CEM solution update rate
-        :param epsilon: The planning will stop early when the solution variance drops below epsilon
+        :param epsilon: The planning will stop early when the solution
+            variance drops below epsilon
         :param action_upper_bounds: Upper bound of each action dimension.
             Only effective when discrete_action=False.
         :param action_lower_bounds: Lower bound of each action dimension.
@@ -98,15 +105,21 @@ class CEMPlannerNetwork(nn.Module):
             self.action_lower_bounds = np.tile(
                 action_lower_bounds, self.plan_horizon_length
             )
+            self.orig_action_upper = torch.tensor(action_upper_bounds)
+            self.orig_action_lower = torch.tensor(action_lower_bounds)
 
-    @torch.no_grad()  # type: ignore
-    def forward(self, input: rlt.PreprocessedState):
-        assert input.state.float_features.shape == (1, self.state_dim)
+    # pyre-fixme[56]: Decorator `torch.no_grad(...)` could not be called, because
+    #  its type `no_grad` is not callable.
+    @torch.no_grad()
+    def forward(self, state: rlt.FeatureData):
+        assert state.float_features.shape == (1, self.state_dim)
         if self.discrete_action:
-            return self.discrete_planning(input)
-        return self.continuous_planning(input)
+            return self.discrete_planning(state)
+        return self.continuous_planning(state)
 
-    @torch.no_grad()  # type: ignore
+    # pyre-fixme[56]: Decorator `torch.no_grad(...)` could not be called, because
+    #  its type `no_grad` is not callable.
+    @torch.no_grad()
     def acc_rewards_of_one_solution(
         self, init_state: torch.Tensor, solution: torch.Tensor, solution_idx: int
     ):
@@ -125,20 +138,21 @@ class CEMPlannerNetwork(nn.Module):
             state = init_state
             mem_net_idx = np.random.randint(0, len(self.mem_net_list))
             for j in range(self.plan_horizon_length):
-                # world_model_input.state shape:
+                # state shape:
                 # (1, 1, state_dim)
-                # world_model_input.action shape:
+                # action shape:
                 # (1, 1, action_dim)
-                world_model_input = rlt.PreprocessedStateAction(
-                    state=rlt.PreprocessedFeatureVector(
-                        float_features=state.reshape((1, 1, self.state_dim))
+                (
+                    reward,
+                    next_state,
+                    not_terminal,
+                    not_terminal_prob,
+                ) = self.sample_reward_next_state_terminal(
+                    state=rlt.FeatureData(state.reshape((1, 1, self.state_dim))),
+                    action=rlt.FeatureData(
+                        solution[j, :].reshape((1, 1, self.action_dim))
                     ),
-                    action=rlt.PreprocessedFeatureVector(
-                        float_features=solution[j, :].reshape((1, 1, self.action_dim))
-                    ),
-                )
-                reward, next_state, not_terminal, not_terminal_prob = self.sample_reward_next_state_terminal(
-                    world_model_input, self.mem_net_list[mem_net_idx]
+                    mem_net=self.mem_net_list[mem_net_idx],
                 )
                 reward_matrix[i, j] = reward * (self.gamma ** j)
 
@@ -155,19 +169,21 @@ class CEMPlannerNetwork(nn.Module):
 
         return np.sum(reward_matrix, axis=1)
 
-    @torch.no_grad()  # type: ignore
+    # pyre-fixme[56]: Decorator `torch.no_grad(...)` could not be called, because
+    #  its type `no_grad` is not callable.
+    @torch.no_grad()
     def acc_rewards_of_all_solutions(
-        self, input: rlt.PreprocessedState, solutions: torch.Tensor
+        self, state: rlt.FeatureData, solutions: torch.Tensor
     ) -> float:
         """
         Calculate accumulated rewards of solutions.
 
-        :param input: the input which contains the starting state
+        :param state: the input which contains the starting state
         :param solutions: its shape is (cem_pop_size, plan_horizon_length, action_dim)
         :returns: a vector of size cem_pop_size, which is the reward of each solution
         """
         acc_reward_vec = np.zeros(self.cem_pop_size)
-        init_state = input.state.float_features
+        init_state = state.float_features
         for i in range(self.cem_pop_size):
             if i % (self.cem_pop_size // 10) == 0:
                 logger.debug(f"Simulating the {i}-th solution...")
@@ -176,12 +192,14 @@ class CEMPlannerNetwork(nn.Module):
             )
         return acc_reward_vec
 
-    @torch.no_grad()  # type: ignore
+    # pyre-fixme[56]: Decorator `torch.no_grad(...)` could not be called, because
+    #  its type `no_grad` is not callable.
+    @torch.no_grad()
     def sample_reward_next_state_terminal(
-        self, world_model_input: rlt.PreprocessedStateAction, mem_net: MemoryNetwork
+        self, state: rlt.FeatureData, action: rlt.FeatureData, mem_net: MemoryNetwork
     ):
         """ Sample one-step dynamics based on the provided world model """
-        wm_output = mem_net(world_model_input)
+        wm_output = mem_net(state, action)
         num_mixtures = wm_output.logpi.shape[2]
         mixture_idx = (
             Categorical(torch.exp(wm_output.logpi.view(num_mixtures)))
@@ -208,12 +226,15 @@ class CEMPlannerNetwork(nn.Module):
         )
         return np.minimum(np.minimum((lb_dist / 2) ** 2, (ub_dist / 2) ** 2), var)
 
-    @torch.no_grad()  # type: ignore
-    def continuous_planning(self, input: rlt.PreprocessedState) -> np.ndarray:
+    # pyre-fixme[56]: Decorator `torch.no_grad(...)` could not be called, because
+    #  its type `no_grad` is not callable.
+    @torch.no_grad()
+    def continuous_planning(self, state: rlt.FeatureData) -> torch.Tensor:
         # TODO: Warmstarts means and vars using previous solutions (T48841404)
         mean = (self.action_upper_bounds + self.action_lower_bounds) / 2
         var = (self.action_upper_bounds - self.action_lower_bounds) ** 2 / 16
-        normal_sampler = stats.truncnorm(  # type: ignore
+        # pyre-fixme[29]: `truncnorm_gen` is not a function.
+        normal_sampler = stats.truncnorm(
             -2, 2, loc=np.zeros_like(mean), scale=np.ones_like(mean)
         )
 
@@ -232,7 +253,7 @@ class CEMPlannerNetwork(nn.Module):
                     (self.cem_pop_size, self.plan_horizon_length, self.action_dim)
                 )
             ).float()
-            acc_rewards = self.acc_rewards_of_all_solutions(input, action_solutions)
+            acc_rewards = self.acc_rewards_of_all_solutions(state, action_solutions)
             elites = solutions[np.argsort(acc_rewards)][-self.num_elites :]
             new_mean = np.mean(elites, axis=0)
             new_var = np.var(elites, axis=0)
@@ -244,10 +265,22 @@ class CEMPlannerNetwork(nn.Module):
 
         # Pick the first action of the optimal solution
         solution = mean[: self.action_dim]
-        return torch.tensor(solution.reshape((1, -1)))
+        raw_action = solution.reshape(-1)
+        low = torch.tensor(CONTINUOUS_TRAINING_ACTION_RANGE[0])
+        high = torch.tensor(CONTINUOUS_TRAINING_ACTION_RANGE[1])
+        # rescale to range (-1, 1) as per canonical output range of continuous agents
+        return rescale_actions(
+            torch.tensor(raw_action),
+            new_min=low,
+            new_max=high,
+            prev_min=self.orig_action_lower,
+            prev_max=self.orig_action_upper,
+        )
 
-    @torch.no_grad()  # type: ignore
-    def discrete_planning(self, input: rlt.PreprocessedState) -> Tuple[int, np.ndarray]:
+    # pyre-fixme[56]: Decorator `torch.no_grad(...)` could not be called, because
+    #  its type `no_grad` is not callable.
+    @torch.no_grad()
+    def discrete_planning(self, state: rlt.FeatureData) -> Tuple[int, np.ndarray]:
         # For discrete actions, we use random shoots to get the best next action
         random_action_seqs = list(
             itertools.product(range(self.action_dim), repeat=self.plan_horizon_length)
@@ -259,7 +292,7 @@ class CEMPlannerNetwork(nn.Module):
         for i, action_seq in enumerate(random_action_seqs):
             for j, act_idx in enumerate(action_seq):
                 action_solutions[i, j, act_idx] = 1
-        acc_rewards = self.acc_rewards_of_all_solutions(input, action_solutions)
+        acc_rewards = self.acc_rewards_of_all_solutions(state, action_solutions)
 
         first_action_tally = np.zeros(self.action_dim)
         reward_tally = np.zeros(self.action_dim)
@@ -273,71 +306,8 @@ class CEMPlannerNetwork(nn.Module):
         best_next_action_one_hot[best_next_action_idx] = 1
 
         logger.debug(
-            f"Choose action {best_next_action_idx}. Stats: {reward_tally} / {first_action_tally}"
+            f"Choose action {best_next_action_idx}."
+            f"Stats: {reward_tally} / {first_action_tally}"
             f" = {reward_tally/first_action_tally} "
         )
         return best_next_action_idx, best_next_action_one_hot
-
-
-class CEMPlanner(ModelBase):
-    def __init__(
-        self,
-        cem_planner_network: CEMPlannerNetwork,
-        plan_horizon_length: int,
-        state_dim: int,
-        action_dim: int,
-        discrete_action: bool,
-    ):
-        super().__init__()
-        self.cem_planner_network = cem_planner_network
-        self.plan_horizon_length = plan_horizon_length
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.discrete_action = discrete_action
-
-    def get_distributed_data_parallel_model(self):
-        return _DistributedDataParallelCEMPlanner(self)
-
-    def input_prototype(self):
-        return rlt.PreprocessedState.from_tensor(torch.randn(1, self.state_dim))
-
-    def forward(self, input: rlt.PreprocessedState):
-        output = self.cem_planner_network(input)
-        if self.discrete_action:
-            return rlt.PlanningPolicyOutput(
-                next_best_discrete_action_idx=output[0],
-                next_best_discrete_action_one_hot=output[1],
-            )
-        return rlt.PlanningPolicyOutput(next_best_continuous_action=output)
-
-
-class _DistributedDataParallelCEMPlanner(ModelBase):
-    def __init__(self, cem_planner: CEMPlanner):
-        super().__init__()
-        self.plan_horizon_length = cem_planner.plan_horizon_length
-        self.state_dim = cem_planner.state_dim
-        self.action_dim = cem_planner.action_dim
-        self.discrete_action = cem_planner.discrete_action
-
-        current_device = torch.cuda.current_device()  # type: ignore
-        self.data_parallel = DistributedDataParallel(
-            cem_planner.cem_planner_network,
-            device_ids=[current_device],
-            output_device=current_device,
-        )
-        self.cem_planner = cem_planner
-
-    def input_prototype(self):
-        return rlt.PreprocessedState.from_tensor(torch.randn(1, self.state_dim))
-
-    def cpu_model(self):
-        return self.cem_planner.cpu_model()
-
-    def forward(self, input: rlt.PreprocessedState):
-        output = self.data_parallel(input)
-        if self.discrete_action:
-            return rlt.PlanningPolicyOutput(
-                next_best_discrete_action_idx=output[0],
-                next_best_discrete_action_one_hot=output[1],
-            )
-        return rlt.PlanningPolicyOutput(next_best_continuous_action=output)

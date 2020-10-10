@@ -3,21 +3,19 @@
 
 import unittest
 
+from reagent.core.fb_checker import IS_FB_ENVIRONMENT
 from reagent.net_builder import continuous_actor
-from reagent.net_builder.continuous_actor_net_builder import ContinuousActorNetBuilder
 from reagent.net_builder.unions import ContinuousActorNetBuilder__Union
 from reagent.parameters import NormalizationData, NormalizationParameters
 from reagent.preprocessing.identify_types import CONTINUOUS
 
 
-try:
+if IS_FB_ENVIRONMENT:
     from reagent.fb.prediction.fb_predictor_wrapper import (
         FbActorPredictorWrapper as ActorPredictorWrapper,
     )
-except ImportError:
-    from reagent.prediction.predictor_wrapper import (  # type: ignore
-        ActorPredictorWrapper,
-    )
+else:
+    from reagent.prediction.predictor_wrapper import ActorPredictorWrapper
 
 
 class TestContinuousActorNetBuilder(unittest.TestCase):
@@ -26,7 +24,7 @@ class TestContinuousActorNetBuilder(unittest.TestCase):
     ) -> None:
         builder = chooser.value
         state_dim = 3
-        state_norm_data = NormalizationData(
+        state_normalization_data = NormalizationData(
             dense_normalization_parameters={
                 i: NormalizationParameters(
                     feature_type=CONTINUOUS, mean=0.0, stddev=1.0
@@ -35,7 +33,7 @@ class TestContinuousActorNetBuilder(unittest.TestCase):
             }
         )
         action_dim = 2
-        action_norm_data = NormalizationData(
+        action_normalization_data = NormalizationData(
             dense_normalization_parameters={
                 i: NormalizationParameters(
                     feature_type=builder.default_action_preprocessing,
@@ -45,7 +43,9 @@ class TestContinuousActorNetBuilder(unittest.TestCase):
                 for i in range(action_dim)
             }
         )
-        actor_network = builder.build_actor(state_norm_data, action_norm_data)
+        actor_network = builder.build_actor(
+            state_normalization_data, action_normalization_data
+        )
         x = actor_network.input_prototype()
         y = actor_network(x)
         action = y.action
@@ -53,7 +53,7 @@ class TestContinuousActorNetBuilder(unittest.TestCase):
         self.assertEqual(action.shape, (1, action_dim))
         self.assertEqual(log_prob.shape, (1, 1))
         serving_module = builder.build_serving_module(
-            actor_network, state_norm_data, action_norm_data
+            actor_network, state_normalization_data, action_normalization_data
         )
         self.assertIsInstance(serving_module, ActorPredictorWrapper)
 

@@ -2,12 +2,14 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 
 from datetime import datetime as RecurringPeriod  # noqa
-from typing import Dict, List, NamedTuple, Optional
+from typing import Dict, List, Optional
 
 # Triggering registration to registries
-import reagent.workflow.result_types  # noqa
+import reagent.core.result_types  # noqa
 import reagent.workflow.training_reports  # noqa
 from reagent.core.dataclasses import dataclass
+from reagent.core.tagged_union import TaggedUnion
+from reagent.models.model_feature_config_provider import ModelFeatureConfigProvider
 from reagent.preprocessing.normalization import (
     DEFAULT_MAX_QUANTILE_SIZE,
     DEFAULT_MAX_UNIQUE_ENUM,
@@ -20,12 +22,14 @@ from reagent.workflow.result_registries import (
     TrainingReport,
     ValidationResult,
 )
-from reagent.workflow.tagged_union import TaggedUnion  # noqa F401
 
 
-@dataclass
-class TableSpec:
-    table_name: str
+try:
+    from reagent.fb.models.model_feature_config_builder import (  # noqa
+        ConfigeratorModelFeatureConfigProvider,
+    )
+except ImportError:
+    pass
 
 
 @dataclass
@@ -34,12 +38,26 @@ class Dataset:
 
 
 @dataclass
+class TableSpec:
+    table_name: str
+    table_sample: Optional[float] = None
+    eval_table_sample: Optional[float] = None
+
+
+@dataclass
 class RewardOptions:
-    pass
+    custom_reward_expression: Optional[str] = None
+    metric_reward_values: Optional[Dict[str, float]] = None
 
 
 @dataclass
 class ReaderOptions:
+    minibatch_size: int = 1024
+    petastorm_reader_pool_type: str = "thread"
+
+
+@dataclass
+class ResourceOptions:
     pass
 
 
@@ -56,6 +74,11 @@ class PreprocessingOptions(BaseDataClass):
     set_missing_value_to_zero: Optional[bool] = False
     whitelist_features: Optional[List[int]] = None
     assert_whitelist_feature_coverage: bool = True
+
+
+@ModelFeatureConfigProvider.fill_union()
+class ModelFeatureConfigProvider__Union(TaggedUnion):
+    pass
 
 
 @PublishingResult.fill_union()
@@ -75,6 +98,7 @@ class RLTrainingReport(TaggedUnion):
 
 @dataclass
 class RLTrainingOutput:
+    output_path: Optional[str] = None
     validation_result: Optional[ValidationResult__Union] = None
     publishing_result: Optional[PublishingResult__Union] = None
     training_report: Optional[RLTrainingReport] = None

@@ -2,19 +2,18 @@
 
 import pickle
 from functools import reduce
-from typing import Mapping, Sequence
+from typing import List, Mapping, Sequence
 
 import torch
-from reagent.ope.estimators.estimator import (
-    Action,
-    ActionDistribution,
-    ActionSpace,
+from reagent.ope.estimators.sequential_estimators import (
     Model,
     RLPolicy,
     State,
     ValueFunction,
 )
+from reagent.ope.estimators.types import Action, ActionDistribution, ActionSpace
 from reagent.ope.test.envs import Environment, PolicyLogGenerator
+from reagent.ope.utils import RunningAverage
 
 
 class TabularPolicy(RLPolicy):
@@ -24,7 +23,7 @@ class TabularPolicy(RLPolicy):
         as_size = len(action_space)
         self._exploitation_prob = 1.0 - epsilon
         self._exploration_prob = epsilon / len(action_space)
-        self._uniform_probs = as_size * [1.0 / as_size]
+        self._uniform_probs: List[float] = as_size * [1.0 / as_size]
         self._state_space = {}
 
     def update(self, state: State, actions: Sequence[float]) -> float:
@@ -98,6 +97,47 @@ class TabularValueFunction(ValueFunction):
 
     def reset(self, clear_state_values: bool = False):
         pass
+
+
+class EstimatedStateValueFunction(ValueFunction):
+    def __init__(
+        self, policy: RLPolicy, env: Environment, gamma: float, num_episodes: int = 100
+    ):
+        self._policy = policy
+        self._env = env
+        self._gamma = gamma
+        self._num_episodes = num_episodes
+        self._state_values = {}
+        self._estimate_value()
+
+    def _estimate_value(self):
+        tgt_generator = PolicyLogGenerator(self._env, self._policy)
+        log = {}
+        for state in self._env.states:
+            mdps = []
+            for _ in range(self._num_episodes):
+                mdps.append(tgt_generator.generate_log(state))
+            log[state] = mdps
+
+        for state, mdps in log.items():
+            avg = RunningAverage()
+            for mdp in mdps:
+                discount = 1.0
+                r = 0.0
+                for t in mdp:
+                    r += discount * t.reward
+                    discount *= self._gamma
+                avg.add(r)
+            self._state_values[state] = avg.average
+
+    def state_action_value(self, state: State, action: Action) -> float:
+        return 0.0
+
+    def state_value(self, state: State) -> float:
+        return self._state_values[state]
+
+    def reset(self):
+        self._state_values = {}
 
 
 class DPValueFunction(TabularValueFunction):

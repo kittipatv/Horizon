@@ -3,14 +3,18 @@
 
 from typing import Dict, List, Optional
 
-import pyspark
-from pyspark.sql.functions import col, collect_list, explode, flatten
+import reagent.types as rlt
+
+# pyre-fixme[21]: Could not find `pyspark`.
+# pyre-fixme[21]: Could not find `pyspark`.
+from pyspark.sql.functions import col, collect_list, explode
 from reagent.preprocessing.normalization import (
     NormalizationParameters,
     get_feature_norm_metadata,
 )
-from reagent.workflow.spark_utils import get_spark_session
-from reagent.workflow.types import PreprocessingOptions, TableSpec
+
+from .spark_utils import get_spark_session
+from .types import PreprocessingOptions, TableSpec
 
 
 def normalization_helper(
@@ -35,11 +39,13 @@ def normalization_helper(
         "skip_quantiles": skip_quantiles,
         "feature_overrides": feature_overrides,
     }
+    # pyre-fixme[9]: whitelist_features has type `Optional[List[int]]`; used as
+    #  `Set[int]`.
+    # pyre-fixme[9]: whitelist_features has type `Optional[List[int]]`; used as
+    #  `Set[int]`.
     whitelist_features = set(whitelist_features or [])
 
-    def validate_whitelist_features(
-        params: Dict[int, NormalizationParameters],
-    ) -> None:
+    def validate_whitelist_features(params: Dict[int, NormalizationParameters]) -> None:
         if not whitelist_features:
             return
         whitelist_feature_set = {int(fid) for fid in whitelist_features}
@@ -76,7 +82,7 @@ def identify_normalization_parameters(
     table_spec: TableSpec,
     column_name: str,
     preprocessing_options: PreprocessingOptions,
-    seed: int,
+    seed: Optional[int] = None,
 ) -> Dict[int, NormalizationParameters]:
     """ Get normalization parameters """
     sqlCtx = get_spark_session()
@@ -99,10 +105,15 @@ def identify_normalization_parameters(
     return normalization_processor(rows)
 
 
-def create_normalization_spec_spark(df, column, num_samples: int, seed: int):
+def create_normalization_spec_spark(
+    df, column, num_samples: int, seed: Optional[int] = None
+):
     """Returns approximately num_samples random rows from column of df."""
 
+    # assumes column has a type of map
     df = df.select(
+        # pyre-fixme[16]: Module `functions` has no attribute `col`.
+        # pyre-fixme[16]: Module `functions` has no attribute `col`.
         explode(col(column).alias("features")).alias("feature_name", "feature_value")
     )
 
@@ -117,9 +128,19 @@ def create_normalization_spec_spark(df, column, num_samples: int, seed: int):
     # perform sampling and collect them
     df = df.sampleBy("feature_name", fractions=frac, seed=seed)
     df = df.groupBy("feature_name").agg(
-        collect_list("feature_value").alias("feature_value_list")
-    )
-    df = df.select(
-        "feature_name", flatten("feature_value_list").alias("feature_values")
+        # pyre-fixme[16]: Module `functions` has no attribute `collect_list`.
+        # pyre-fixme[16]: Module `functions` has no attribute `collect_list`.
+        collect_list("feature_value").alias("feature_values")
     )
     return df
+
+
+# TODO: for OSS
+def identify_sparse_normalization_parameters(
+    feature_config: rlt.ModelFeatureConfig,
+    table_spec: TableSpec,
+    id_list_column: str,
+    id_score_list_column: str,
+    preprocessing_options: PreprocessingOptions,
+):
+    return {}

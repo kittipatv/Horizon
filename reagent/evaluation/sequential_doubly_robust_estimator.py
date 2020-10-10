@@ -80,29 +80,50 @@ class SequentialDoublyRobustEstimator:
                     )
                     episode_value *= self.gamma
                     episode_value += logged_rewards[j]
-                if episode_value > 1e-6 or episode_value < -1e-6:
-                    doubly_robusts.append(float(doubly_robust))
-                    episode_values.append(float(episode_value))
+
+                doubly_robusts.append(float(doubly_robust))
+                episode_values.append(float(episode_value))
                 last_episode_end = episode_end
             i += 1
 
-        assert len(doubly_robusts) > 0, (
-            f"No valid doubly robusts data is generated. "
-            f"Logged_rewards={logged_rewards}, importance_weight={importance_weight},"
-            f" estimated_q_values_for_logged_action={estimated_q_values_for_logged_action}"
-            f" estimated_state_values={estimated_state_values}, gamma={self.gamma}"
-            f" Did you specify wrong metric names?"
-        )
+        if len(doubly_robusts) == 0:
+            torch.set_printoptions(profile="full")
+            zipped_data = list(
+                zip(
+                    *map(
+                        lambda x: x.tolist(),
+                        [
+                            edp.mdp_id,
+                            logged_rewards,
+                            estimated_state_values,
+                            estimated_q_values_for_logged_action,
+                            importance_weight,
+                        ],
+                    )
+                )
+            )
+            raise RuntimeError(
+                f"No valid doubly robusts data is generated.\n"
+                f"mdp_ids x logged_rewards x estimated_state_values x "
+                f"estimated_q_values_for_logged_action x importance_weight:\n"
+                f"{zipped_data};\n"
+                f"gamma={self.gamma};\n"
+                f"Did you specify wrong metric names?"
+            )
 
-        doubly_robusts = np.array(doubly_robusts)  # type: ignore
+        # pyre-fixme[9]: doubly_robusts has type `List[float]`; used as `ndarray`.
+        doubly_robusts = np.array(doubly_robusts)
         dr_score = float(np.mean(doubly_robusts))
         dr_score_std_error = bootstrapped_std_error_of_mean(doubly_robusts)
 
-        episode_values = np.array(episode_values)  # type: ignore
+        # pyre-fixme[9]: episode_values has type `List[float]`; used as `ndarray`.
+        episode_values = np.array(episode_values)
         logged_policy_score = np.mean(episode_values)
         if logged_policy_score < 1e-6:
             logger.warning(
-                "Can't normalize SDR-CPE because of small or negative logged_policy_score"
+                "Can't normalize SDR-CPE because of small"
+                f" or negative logged_policy_score ({logged_policy_score})."
+                f"Episode values: {episode_values}."
             )
             return CpeEstimate(
                 raw=dr_score,

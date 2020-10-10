@@ -32,7 +32,7 @@ REPLAY_CAPACITY = 100
 class PrioritizedReplayBufferTest(unittest.TestCase):
     def create_default_memory(self):
         return prioritized_replay_buffer.PrioritizedReplayBuffer(
-            SCREEN_SIZE, STACK_SIZE, REPLAY_CAPACITY, BATCH_SIZE, max_sample_attempts=10
+            STACK_SIZE, REPLAY_CAPACITY, BATCH_SIZE, max_sample_attempts=10
         )  # For faster tests.
 
     def add_blank(self, memory, action=0, reward=0.0, terminal=0, priority=1.0):
@@ -48,7 +48,13 @@ class PrioritizedReplayBufferTest(unittest.TestCase):
           Index of the transition just added.
         """
         dummy = np.zeros(SCREEN_SIZE)
-        memory.add(dummy, action, reward, terminal, priority)
+        memory.add(
+            observation=dummy,
+            action=action,
+            reward=reward,
+            terminal=terminal,
+            priority=priority,
+        )
         index = (memory.cursor() - 1) % REPLAY_CAPACITY
         return index
 
@@ -63,8 +69,8 @@ class PrioritizedReplayBufferTest(unittest.TestCase):
 
         # Check that the prioritized replay buffer expects an additional argument
         # for priority.
-        with self.assertRaisesRegexp(ValueError, "Add expects"):
-            memory.add(zeros, 0, 0, 0)
+        with self.assertRaisesRegex(ValueError, "Add expects"):
+            memory.add(observation=zeros, action=0, reward=0, terminal=0)
 
     def testDummyScreensAddedToNewMemory(self):
         memory = self.create_default_memory()
@@ -110,11 +116,9 @@ class PrioritizedReplayBufferTest(unittest.TestCase):
             self.add_blank(memory, terminal=1)
         # This test should always pass.
         for _ in range(100):
-            _, _, _, _, _, _, terminals, _, _ = memory.sample_transition_batch(
-                batch_size=2
-            )
+            batch = memory.sample_transition_batch(batch_size=2)
             # Ensure all terminals are set to 1.
-            self.assertTrue((terminals == 1).all())
+            self.assertTrue((batch.terminal == 1).all())
 
     def testSampleIndexBatchTooManyFailedRetries(self):
         memory = self.create_default_memory()
@@ -132,11 +136,7 @@ class PrioritizedReplayBufferTest(unittest.TestCase):
 
     def testSampleIndexBatch(self):
         memory = prioritized_replay_buffer.PrioritizedReplayBuffer(
-            SCREEN_SIZE,
-            STACK_SIZE,
-            REPLAY_CAPACITY,
-            BATCH_SIZE,
-            max_sample_attempts=REPLAY_CAPACITY,
+            STACK_SIZE, REPLAY_CAPACITY, BATCH_SIZE, max_sample_attempts=10
         )
         # This will ensure we end up with cursor == 1.
         for _ in range(REPLAY_CAPACITY - STACK_SIZE + 2):

@@ -3,21 +3,19 @@
 
 import unittest
 
+from reagent.core.fb_checker import IS_FB_ENVIRONMENT
 from reagent.net_builder import parametric_dqn
-from reagent.net_builder.parametric_dqn_net_builder import ParametricDQNNetBuilder
 from reagent.net_builder.unions import ParametricDQNNetBuilder__Union
-from reagent.parameters import NormalizationParameters
+from reagent.parameters import NormalizationData, NormalizationParameters
 from reagent.preprocessing.identify_types import CONTINUOUS
 
 
-try:
+if IS_FB_ENVIRONMENT:
     from reagent.fb.prediction.fb_predictor_wrapper import (
         FbParametricDqnPredictorWrapper as ParametricDqnPredictorWrapper,
     )
-except ImportError:
-    from reagent.prediction.predictor_wrapper import (  # type: ignore
-        ParametricDqnPredictorWrapper,
-    )
+else:
+    from reagent.prediction.predictor_wrapper import ParametricDqnPredictorWrapper
 
 
 class TestParametricDQNNetBuilder(unittest.TestCase):
@@ -26,21 +24,31 @@ class TestParametricDQNNetBuilder(unittest.TestCase):
     ) -> None:
         builder = chooser.value
         state_dim = 3
-        state_norm_params = {
-            i: NormalizationParameters(feature_type=CONTINUOUS, mean=0.0, stddev=1.0)
-            for i in range(state_dim)
-        }
+        state_normalization_data = NormalizationData(
+            dense_normalization_parameters={
+                i: NormalizationParameters(
+                    feature_type=CONTINUOUS, mean=0.0, stddev=1.0
+                )
+                for i in range(state_dim)
+            }
+        )
         action_dim = 2
-        action_norm_params = {
-            i: NormalizationParameters(feature_type=CONTINUOUS, mean=0.0, stddev=1.0)
-            for i in range(action_dim)
-        }
-        q_network = builder.build_q_network(state_norm_params, action_norm_params)
+        action_normalization_data = NormalizationData(
+            dense_normalization_parameters={
+                i: NormalizationParameters(
+                    feature_type=CONTINUOUS, mean=0.0, stddev=1.0
+                )
+                for i in range(action_dim)
+            }
+        )
+        q_network = builder.build_q_network(
+            state_normalization_data, action_normalization_data
+        )
         x = q_network.input_prototype()
-        y = q_network(x).q_value
+        y = q_network(*x)
         self.assertEqual(y.shape, (1, 1))
         serving_module = builder.build_serving_module(
-            q_network, state_norm_params, action_norm_params
+            q_network, state_normalization_data, action_normalization_data
         )
         self.assertIsInstance(serving_module, ParametricDqnPredictorWrapper)
 

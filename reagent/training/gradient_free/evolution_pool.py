@@ -50,6 +50,7 @@ class EvolutionPool:
             self.parent_tensors[tensor_name] = torch.randn(
                 tensor_size, dtype=torch.float
             )
+            # pyre-fixme[16]: `Tensor` has no attribute `grad`.
             self.parent_tensors[tensor_name].grad = torch.randn(
                 tensor_size, dtype=torch.float
             )
@@ -74,12 +75,14 @@ class EvolutionPool:
         if torch.abs(std_dev) > 1e-6:
             normalized_rewards = (rewards - torch.mean(rewards)) / std_dev
             for parent_tensor in self.parent_tensors.values():
+                # pyre-fixme[16]: `Tensor` has no attribute `grad`.
                 parent_tensor.grad.zero_()
             for i, individual in enumerate(self.population_tensors):
                 for tensor_name, parent_tensor in self.parent_tensors.items():
                     individual_tensor = individual[tensor_name]
 
                     # Subtract the parent to get the gradient estimate
+                    # pyre-fixme[16]: `Tensor` has no attribute `sub_`.
                     individual_tensor.sub_(parent_tensor)
 
                     # Amplify the gradient by the reward

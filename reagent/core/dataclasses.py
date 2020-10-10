@@ -7,12 +7,13 @@ import os
 
 # Redirection to make import simpler
 from dataclasses import field  # noqa
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import pydantic
+from reagent.core.fb_checker import IS_FB_ENVIRONMENT
 
 
-try:
+if IS_FB_ENVIRONMENT:
     import fblearner.flow.api  # noqa
 
     """
@@ -20,10 +21,11 @@ try:
     validator. This necessary to avoid pydantic complaining about validators.
     """
     USE_VANILLA_DATACLASS = True
-
-except ImportError:
-
+else:
     USE_VANILLA_DATACLASS = False
+
+
+ARBITRARY_TYPES_ALLOWED = True
 
 
 try:
@@ -33,10 +35,18 @@ except KeyError:
     pass
 
 
-logger = logging.getLogger(__name__)
+try:
+    ARBITRARY_TYPES_ALLOWED = bool(int(os.environ["ARBITRARY_TYPES_ALLOWED"]))
+except KeyError:
+    pass
 
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 logger.info(f"USE_VANILLA_DATACLASS: {USE_VANILLA_DATACLASS}")
+logger.info(f"ARBITRARY_TYPES_ALLOWED: {ARBITRARY_TYPES_ALLOWED}")
 
 
 if TYPE_CHECKING:
@@ -47,9 +57,7 @@ if TYPE_CHECKING:
 
 else:
 
-    def dataclass(
-        _cls: Optional[pydantic.typing.AnyType] = None, *, config=None, **kwargs
-    ):
+    def dataclass(_cls: Optional[Any] = None, *, config=None, **kwargs):
         def wrap(cls):
             # We don't want to look at parent class
             if "__post_init__" in cls.__dict__:
@@ -71,6 +79,14 @@ else:
 
                 return dataclasses.dataclass(**kwargs)(cls)
             else:
+                if ARBITRARY_TYPES_ALLOWED:
+
+                    class Config:
+                        arbitrary_types_allowed = ARBITRARY_TYPES_ALLOWED
+
+                    assert config not in kwargs
+                    kwargs["config"] = Config
+
                 return pydantic.dataclasses.dataclass(cls, **kwargs)
 
         if _cls is None:

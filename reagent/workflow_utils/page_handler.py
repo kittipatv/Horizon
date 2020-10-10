@@ -14,12 +14,7 @@ from reagent.evaluation.evaluation_data_page import EvaluationDataPage
 from reagent.tensorboardX import SummaryWriterContext
 from reagent.training.sac_trainer import SACTrainer
 from reagent.training.td3_trainer import TD3Trainer
-from reagent.types import (
-    ExtraData,
-    PreprocessedMemoryNetworkInput,
-    PreprocessedTrainingBatch,
-    RawTrainingBatch,
-)
+from reagent.types import MemoryNetworkInput, PreprocessedTrainingBatch
 
 
 logger = logging.getLogger(__name__)
@@ -69,6 +64,8 @@ class PageHandler:
         self.epoch = epoch
 
 
+# TODO: remove.
+# Use new DataLoaderWrapper & EpochIterator (see OSS train_and_evaluate_generic)
 @observable(epoch_end=int)
 class TrainingPageHandler(PageHandler):
     def handle(self, tdp: PreprocessedTrainingBatch) -> None:
@@ -76,11 +73,14 @@ class TrainingPageHandler(PageHandler):
         self.trainer_or_evaluator.train(tdp)
 
     def finish(self) -> None:
-        self.notify_observers(epoch_end=self.epoch)  # type: ignore
+        # pyre-fixme[16]: `TrainingPageHandler` has no attribute `notify_observers`.
+        self.notify_observers(epoch_end=self.epoch)
         self.trainer_or_evaluator.loss_reporter.flush()
         self.epoch += 1
 
 
+# TODO: remove.
+# Use new DataLoaderWrapper & EpochIterator (see OSS train_and_evaluate_generic)
 class EvaluationPageHandler(PageHandler):
     def __init__(self, trainer, evaluator, reporter):
         self.trainer = trainer
@@ -101,17 +101,19 @@ class EvaluationPageHandler(PageHandler):
         if self.evaluation_data is None:
             self.evaluation_data = edp
         else:
+            # pyre-fixme[16]: `Optional` has no attribute `append`.
             self.evaluation_data = self.evaluation_data.append(edp)
 
     def finish(self) -> None:
         if self.evaluation_data is None:
             return
         # Making sure the data is sorted for CPE
+        # pyre-fixme[16]: `Optional` has no attribute `sort`.
         self.evaluation_data = self.evaluation_data.sort()
-        self.evaluation_data = self.evaluation_data.compute_values(  # type: ignore
-            self.trainer.gamma
-        )  # type: ignore
-        self.evaluation_data.validate()  # type: ignore
+        # pyre-fixme[16]: `Optional` has no attribute `compute_values`.
+        self.evaluation_data = self.evaluation_data.compute_values(self.trainer.gamma)
+        # pyre-fixme[16]: `Optional` has no attribute `validate`.
+        self.evaluation_data.validate()
         start_time = time.time()
         evaluation_details = self.evaluator.evaluate_post_training(self.evaluation_data)
         self.reporter.report(evaluation_details)
@@ -127,58 +129,45 @@ class EvaluationPageHandler(PageHandler):
 
 class WorldModelTrainingPageHandler(PageHandler):
     def handle(self, tdp: PreprocessedTrainingBatch) -> None:
-        losses = self.trainer_or_evaluator.train(tdp, batch_first=True)
+        losses = self.trainer_or_evaluator.train(tdp)
         self.results.append(losses)
 
 
 class WorldModelRandomTrainingPageHandler(PageHandler):
     """ Train a baseline model based on randomly shuffled data """
 
-    def handle(self, tdp: PreprocessedTrainingBatch) -> None:
-        assert isinstance(tdp.training_input, PreprocessedMemoryNetworkInput)
-        batch_size, _, _ = tdp.training_input.next_state.float_features.size()
+    # pyre-fixme[14]: `handle` overrides method defined in `PageHandler` inconsistently.
+    def handle(self, training_input: MemoryNetworkInput) -> None:
+        _, batch_size, _ = training_input.next_state.float_features.size()
 
-        tdp = PreprocessedTrainingBatch(
-            training_input=PreprocessedMemoryNetworkInput(
-                state=tdp.training_input.state,
-                action=tdp.training_input.action,  # type: ignore
-                time_diff=torch.ones_like(
-                    tdp.training_input.reward[torch.randperm(batch_size)]
-                ).float(),
-                # shuffle the data
-                next_state=tdp.training_input.next_state._replace(
-                    float_features=tdp.training_input.next_state.float_features[
-                        torch.randperm(batch_size)
-                    ]
-                ),
-                reward=tdp.training_input.reward[torch.randperm(batch_size)],
-                not_terminal=tdp.training_input.not_terminal[  # type: ignore
-                    torch.randperm(batch_size)
-                ],
-                step=None,
+        tdp = MemoryNetworkInput(
+            state=training_input.state,
+            action=training_input.action,
+            time_diff=torch.ones_like(training_input.reward),
+            # shuffle the data
+            next_state=training_input.next_state._replace(
+                float_features=training_input.next_state.float_features[
+                    :, torch.randperm(batch_size), :
+                ]
             ),
-            extras=ExtraData(),
+            reward=training_input.reward[:, torch.randperm(batch_size)],
+            not_terminal=training_input.not_terminal[  # type: ignore
+                :, torch.randperm(batch_size)
+            ],
+            step=None,
         )
-        losses = self.trainer_or_evaluator.train(tdp, batch_first=True)
+        losses = self.trainer_or_evaluator.train(tdp)
         self.results.append(losses)
 
 
 class WorldModelEvaluationPageHandler(PageHandler):
-    def handle(self, tdp: PreprocessedTrainingBatch) -> None:
+    # pyre-fixme[14]: `handle` overrides method defined in `PageHandler` inconsistently.
+    def handle(self, tdp: MemoryNetworkInput) -> None:
         losses = self.trainer_or_evaluator.evaluate(tdp)
         self.results.append(losses)
 
 
-class ImitatorPageHandler(PageHandler):
-    def __init__(self, trainer, train=True):
-        super().__init__(trainer)
-        self.train = train
-
-    def handle(self, tdp: PreprocessedTrainingBatch) -> None:
-        losses = self.trainer_or_evaluator.train(tdp, train=self.train)
-        self.results.append(losses)
-
-
+@observable(epoch_end=int)
 class RankingTrainingPageHandler(PageHandler):
     def __init__(self, trainer) -> None:
         super().__init__(trainer)
@@ -191,27 +180,31 @@ class RankingTrainingPageHandler(PageHandler):
         self.results.append(res_dict)
 
     def finish(self):
-        if "ips_rl_loss" in self.results[0]:
+        self.notify_observers(epoch_end=self.epoch)
+        result_template = self.results[0]
+        if result_template and "ips_rl_loss" in result_template:
             self.policy_gradient_loss.append(
                 float(self.get_mean_loss(loss_name="ips_rl_loss"))
             )
-        if "baseline_loss" in self.results[0]:
+        if result_template and "baseline_loss" in result_template:
             self.baseline_loss.append(
                 float(self.get_mean_loss(loss_name="baseline_loss"))
             )
-        if "per_seq_probs" in self.results[0]:
+        if result_template and "per_seq_probs" in result_template:
             self.per_seq_probs.append(
                 float(self.get_mean_loss(loss_name="per_seq_probs"))
             )
         self.refresh_results()
 
 
+@observable(epoch_end=int)
 class RankingEvaluationPageHandler(PageHandler):
     def handle(self, tdp: PreprocessedTrainingBatch) -> None:
         self.trainer_or_evaluator.evaluate(tdp)
 
     def finish(self):
         eval_res = self.trainer_or_evaluator.evaluate_post_training()
+        self.notify_observers(epoch_end=self.epoch)  # type: ignore
         self.results.append(eval_res)
 
 
@@ -229,10 +222,14 @@ class RewardNetTrainingPageHandler(PageHandler):
         self.refresh_results()
 
 
+# TODO: remove.
+# Use new DataLoaderWrapper & EpochIterator (see OSS train_and_evaluate_generic)
 def get_actual_minibatch_size(batch, minibatch_size_preset):
-    if isinstance(batch, (PreprocessedTrainingBatch, RawTrainingBatch)):
-        batch_size = batch.batch_size()
-    elif isinstance(batch, OrderedDict):
+    try:
+        return batch.batch_size()
+    except AttributeError:
+        pass
+    if isinstance(batch, OrderedDict):
         first_key = next(iter(batch.keys()))
         batch_size = len(batch[first_key])
     else:
@@ -240,6 +237,8 @@ def get_actual_minibatch_size(batch, minibatch_size_preset):
     return batch_size
 
 
+# TODO: remove.
+# Use new DataLoaderWrapper & EpochIterator (see OSS train_and_evaluate_generic)
 def feed_pages(
     data_loader,
     dataset_num_rows,
@@ -247,15 +246,20 @@ def feed_pages(
     minibatch_size,
     use_gpu,
     page_handler,
-    batch_preprocessor=None,
+    # used before batch is handled by page_handler
+    post_data_loader_preprocessor=None,
 ):
     num_rows_processed = 0
     num_rows_to_process_for_progress_tick = max(1, dataset_num_rows // 100)
     last_percent_reported = -1
 
     for batch in data_loader:
+        if post_data_loader_preprocessor:
+            batch = post_data_loader_preprocessor(batch)
+
         if use_gpu:
             batch = batch.cuda()
+
         batch_size = get_actual_minibatch_size(batch, minibatch_size)
         num_rows_processed += batch_size
 
@@ -274,8 +278,6 @@ def feed_pages(
                 )
             )
 
-        if batch_preprocessor:
-            batch = batch_preprocessor(batch)
         page_handler.handle(batch)
 
     page_handler.finish()

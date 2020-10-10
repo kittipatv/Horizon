@@ -8,10 +8,11 @@ import numpy as np
 import torch
 from reagent.ope.estimators.sequential_estimators import (
     DMEstimator,
-    DREstimator,
+    DoublyRobustEstimator,
     EpsilonGreedyRLPolicy,
     IPSEstimator,
     MAGICEstimator,
+    NeuralDualDICE,
     RandomRLPolicy,
     RewardProbability,
     RLEstimatorInput,
@@ -25,6 +26,7 @@ from reagent.ope.test.envs import Environment, PolicyLogGenerator
 from reagent.ope.trainers.rl_tabular_trainers import (
     DPTrainer,
     DPValueFunction,
+    EstimatedStateValueFunction,
     TabularPolicy,
 )
 
@@ -37,19 +39,26 @@ class GridWorld(Environment):
         goal: Tuple[int, int],
         max_horizon: int = -1,
         walls: Iterable[Tuple[int, int]] = (),
+        use_taxicab_reward: bool = False,
     ):
         super().__init__(max_horizon)
         self.size = size
         self.start = start
         self.goal = goal
         self.walls = set(walls)
+        self.use_taxicab_reward = use_taxicab_reward
         self.reset()
 
     @classmethod
-    def from_grid(cls, grid: Sequence[Sequence[str]], max_horizon: int = -1):
+    def from_grid(
+        cls,
+        grid: Sequence[Sequence[str]],
+        max_horizon: int = -1,
+        use_taxicab_reward: bool = False,
+    ):
         size = (len(grid), len(grid[0]))
-        start = ()
-        goal = ()
+        start = (0, 0)
+        goal = (0, 0)
         walls = []
         for x, r in enumerate(grid):
             for y, c in enumerate(r):
@@ -60,7 +69,32 @@ class GridWorld(Environment):
                     goal = (x, y)
                 elif g == "w":
                     walls += ((x, y),)
-        return cls(size, start, goal, max_horizon, walls)
+        return cls(size, start, goal, max_horizon, walls, use_taxicab_reward)
+
+    @classmethod
+    def random_grid(
+        cls,
+        length: int,
+        max_horizon: int = -1,
+        wall_prob: float = 0.1,
+        use_taxicab_reward: bool = False,
+    ):
+        """
+        Generates a random grid of size length x length with start = (0, 0) and
+        goal = (length-1, length-1)
+        """
+        size = (length, length)
+        start = (0, 0)
+        goal = (length - 1, length - 1)
+        walls = []
+        for r in range(length):
+            for c in range(length):
+                if (r, c) == start or (r, c) == goal:
+                    continue
+                else:
+                    if random.uniform(0, 1) < wall_prob:
+                        walls.append((r, c))
+        return cls(size, start, goal, max_horizon, walls, use_taxicab_reward)
 
     def reset(self, state: Optional[State] = None):
         super().reset(state)
@@ -86,10 +120,27 @@ class GridWorld(Environment):
         elif to_pos == self.goal:
             return to_pos, 1.0, True
         else:
-            return to_pos, 0.0, False
+            return (
+                to_pos,
+                0.0
+                if not self.use_taxicab_reward
+                else np.exp(-2 * self._taxi_distance(to_pos, self.goal) / self.size[0]),
+                False,
+            )
+
+    def _taxi_distance(
+        self, from_pos: Tuple[int, int], to_pos: Tuple[int, int]
+    ) -> float:
+        return abs(from_pos[0] - to_pos[0]) + abs(from_pos[1] - to_pos[1])
 
     def _next_state_reward(self, state: State, action: Action) -> StateReward:
-        x, y = state.value
+        value = state.value
+        assert isinstance(value, tuple), f"got type {type(value)} instead of tuple"
+        # pyre-fixme[23]: Unable to unpack single value, 2 were expected.
+        (x, y) = value
+        assert isinstance(x, int) and isinstance(
+            y, int
+        ), "Gridworld expects states to be Tuple[int, int]"
         if state.value in self.walls or state.value == self.goal:
             return StateReward(State((x, y), state.is_terminal), 0.0)
         if action.value == 0:
@@ -104,6 +155,7 @@ class GridWorld(Environment):
 
     def next_state_reward_dist(self, state: State, action: Action) -> StateDistribution:
         sr = self._next_state_reward(state, action)
+        assert sr.state is not None
         return {sr.state: RewardProbability(sr.reward, 1.0)}
 
     @property
@@ -166,7 +218,7 @@ class GridWorld(Environment):
                 elif pos in self.walls:
                     dump += "\u2588"
                 else:
-                    action = policy(State(pos)).greedy()
+                    action = policy(State(pos)).greedy()[0]
                     if action.value == 0:
                         dump += "\u21e9"
                     elif action.value == 1:
@@ -226,6 +278,9 @@ class NoiseGridWorldModel(Environment):
 
     def next_state_reward_dist(self, state: State, action: Action) -> StateDistribution:
         probs = [self.noise_prob] * len(self.action_space)
+        assert isinstance(
+            action.value, int
+        ), f"got type {type(action.value)} instead of int"
         probs[action.value] = 1 - self.epsilon
         states = {}
         for a in self.action_space:
@@ -257,6 +312,7 @@ class NoiseGridWorldModel(Environment):
 
 
 GAMMA = 0.9
+USE_DP_VALUE_FUNC = True
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
@@ -268,23 +324,7 @@ if __name__ == "__main__":
     device = torch.device("cuda") if torch.cuda.is_available() else None
     print(f"device - {device}")
 
-    gridworld = GridWorld.from_grid(
-        [
-            ["s", "0", "0", "0", "0"],
-            ["0", "0", "0", "W", "0"],
-            ["0", "0", "0", "0", "0"],
-            ["0", "W", "0", "0", "0"],
-            ["0", "0", "0", "0", "g"],
-        ],
-        # [
-        #     ["s", "0", "0", "0"],
-        #     ["0", "0", "0", "0"],
-        #     ["0", "0", "0", "0"],
-        #     ["0", "0", "0", "g"],
-        # ],
-        max_horizon=1000,
-    )
-    # gridworld = ThomasGridWorld()
+    gridworld = GridWorld.random_grid(10, max_horizon=250, use_taxicab_reward=True)
     logging.info(f"GridWorld:\n{gridworld}")
 
     action_space = ActionSpace(4)
@@ -295,26 +335,35 @@ if __name__ == "__main__":
     logging.info(f"Opt Policy:\n{gridworld.dump_policy(opt_policy)}")
     logging.info(f"Opt state values:\n{gridworld.dump_value_func(value_func)}")
 
-    behavivor_policy = RandomRLPolicy(action_space)
+    # behavivor_policy = RandomRLPolicy(action_space)
+    behavivor_policy = EpsilonGreedyRLPolicy(opt_policy, 0.7)
     target_policy = EpsilonGreedyRLPolicy(opt_policy, 0.3)
-    model = NoiseGridWorldModel(gridworld, action_space, epsilon=0.3, max_horizon=1000)
+
+    model = NoiseGridWorldModel(gridworld, action_space, epsilon=0.1, max_horizon=1000)
     value_func = DPValueFunction(target_policy, model, GAMMA)
-    ground_truth = DPValueFunction(target_policy, gridworld, GAMMA)
+    ground_truth: Optional[ValueFunction] = None
+    if USE_DP_VALUE_FUNC:
+        ground_truth = DPValueFunction(target_policy, gridworld, GAMMA)
+    else:
+        ground_truth = EstimatedStateValueFunction(target_policy, gridworld, GAMMA)
 
     logging.info(
         f"Target Policy ground truth values:\n"
         f"{gridworld.dump_value_func(ground_truth)}"
     )
 
-    log = {}
+    logging.info(
+        f"Logging Policy values:\n"
+        f"{gridworld.dump_value_func(DPValueFunction(behavivor_policy, model, GAMMA))}"
+    )
+
+    log = []
     log_generator = PolicyLogGenerator(gridworld, behavivor_policy)
-    num_episodes = 200
+    num_episodes = 50
     for state in gridworld.states:
-        mdps = []
         for _ in range(num_episodes):
-            mdps.append(log_generator.generate_log(state))
-        log[state] = mdps
-        logging.info(f"Generated {len(mdps)} logs for {state}")
+            log.append(log_generator.generate_log(state))
+        logging.info(f"Generated {num_episodes} logs for {state}")
 
     estimator_input = RLEstimatorInput(
         gamma=GAMMA,
@@ -323,6 +372,17 @@ if __name__ == "__main__":
         value_function=value_func,
         ground_truth=ground_truth,
     )
+
+    NeuralDualDICE(
+        device=device,
+        state_dim=2,
+        action_dim=4,
+        deterministic_env=True,
+        average_next_v=False,
+        value_lr=0.001,
+        zeta_lr=0.0001,
+        batch_size=512,
+    ).evaluate(estimator_input)
 
     DMEstimator(device=device).evaluate(estimator_input)
 
@@ -333,10 +393,10 @@ if __name__ == "__main__":
         estimator_input
     )
 
-    DREstimator(weight_clamper=None, weighted=False, device=device).evaluate(
+    DoublyRobustEstimator(weight_clamper=None, weighted=False, device=device).evaluate(
         estimator_input
     )
-    DREstimator(weight_clamper=None, weighted=True, device=device).evaluate(
+    DoublyRobustEstimator(weight_clamper=None, weighted=True, device=device).evaluate(
         estimator_input
     )
 

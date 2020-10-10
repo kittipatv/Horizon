@@ -2,9 +2,10 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List, Optional
 
 from reagent.core.tracker import Aggregator, Observer
+from reagent.tensorboardX import SummaryWriterContext
 
 
 logger = logging.getLogger(__name__)
@@ -15,7 +16,7 @@ class CompositeObserver(Observer):
     A composite observer which takes care of dispatching values to child observers
     """
 
-    def __init__(self, observers: List[Observer]):
+    def __init__(self, observers: Iterable[Observer]):
         self.observers: Dict[str, List[Observer]] = {}
         for observer in observers:
             observing_keys = observer.get_observing_keys()
@@ -58,27 +59,59 @@ class ValueListObserver(Observer):
         self.values = []
 
 
+class TensorBoardScalarObserver(Observer):
+    def __init__(self, key: str, logging_key: Optional[str]):
+        super().__init__(observing_keys=[key])
+        self.key = key
+        self.logging_key = logging_key or key
+
+    def update(self, key: str, value):
+        # pyre-fixme[16]: `SummaryWriterContext` has no attribute `add_scalar`.
+        SummaryWriterContext.add_scalar(self.logging_key, value)
+
+
 class IntervalAggregatingObserver(Observer):
-    def __init__(self, interval: int, aggregator: Aggregator):
+    def __init__(
+        self,
+        interval: Optional[int],
+        aggregator: Aggregator,
+        observe_epoch_end: bool = True,
+    ):
         self.key = aggregator.key
-        super().__init__(observing_keys=[self.key])
+        obs_keys = ["epoch_end"] if observe_epoch_end else []
+        obs_keys.append(self.key)
+        super().__init__(observing_keys=obs_keys)
         self.iteration = 0
         self.interval = interval
         self.intermediate_values: List[Any] = []
         self.aggregator = aggregator
 
     def update(self, key: str, value):
-        self.intermediate_values.append(value)
+        if key == "epoch_end":
+            self.flush()
+            return
 
+        self.intermediate_values.append(value)
         self.iteration += 1
-        if self.iteration % self.interval == 0:
+        # pyre-fixme[58]: `%` is not supported for operand types `int` and
+        #  `Optional[int]`.
+        if self.interval and self.iteration % self.interval == 0:
+            logger.debug(
+                "Interval Agg. Update: %s; iteration %s; aggregator: %s",
+                self.key,
+                self.iteration,
+                self.aggregator.__class__.__name__,
+            )
             self.aggregator(self.key, self.intermediate_values)
             self.intermediate_values = []
 
     def flush(self):
         # We need to reset iteration here to avoid aggregating on the same data multiple
         # times
-        logger.info(f"Flushing: {self.key}; iteration: {self.iteration}")
+        logger.info(
+            f"Interval Agg. Flushing: {self.key}; iteration: {self.iteration}; "
+            f"aggregator: {self.aggregator.__class__.__name__}; points: {len(self.intermediate_values)}"
+        )
         self.iteration = 0
         if self.intermediate_values:
             self.aggregator(self.key, self.intermediate_values)

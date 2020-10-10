@@ -21,6 +21,7 @@ Hessel for providing useful pointers on the algorithm and its implementation.
 """
 
 import numpy as np
+import torch
 from reagent.replay_memory import circular_replay_buffer, sum_tree
 from reagent.replay_memory.circular_replay_buffer import ReplayElement
 
@@ -32,110 +33,64 @@ class PrioritizedReplayBuffer(circular_replay_buffer.ReplayBuffer):
 
     def __init__(
         self,
-        observation_shape,
         stack_size,
         replay_capacity,
         batch_size,
         update_horizon=1,
         gamma=0.99,
         max_sample_attempts=1000,
-        extra_storage_types=None,
-        observation_dtype=np.uint8,
-        terminal_dtype=np.uint8,
-        action_shape=(),
-        action_dtype=np.int32,
-        reward_shape=(),
-        reward_dtype=np.float32,
     ):
         """Initializes PrioritizedReplayBuffer.
         Args:
-          observation_shape: tuple of ints.
           stack_size: int, number of frames to use in state stack.
           replay_capacity: int, number of transitions to keep in memory.
           batch_size: int.
           update_horizon: int, length of update ('n' in n-step update).
           gamma: int, the discount factor.
-          max_sample_attempts: int, the maximum number of attempts allowed to
-            get a sample.
-          extra_storage_types: list of ReplayElements defining the type of the extra
-            contents that will be stored and returned by sample_transition_batch.
-          observation_dtype: np.dtype, type of the observations. Defaults to
-            np.uint8 for Atari 2600.
-          terminal_dtype: np.dtype, type of the terminals. Defaults to np.uint8 for
-            Atari 2600.
-          action_shape: tuple of ints, the shape for the action vector. Empty tuple
-            means the action is a scalar.
-          action_dtype: np.dtype, type of elements in the action.
-          reward_shape: tuple of ints, the shape of the reward vector. Empty tuple
-            means the reward is a scalar.
-          reward_dtype: np.dtype, type of elements in the reward.
         """
         super(PrioritizedReplayBuffer, self).__init__(
-            observation_shape=observation_shape,
             stack_size=stack_size,
             replay_capacity=replay_capacity,
             batch_size=batch_size,
             update_horizon=update_horizon,
             gamma=gamma,
-            max_sample_attempts=max_sample_attempts,
-            extra_storage_types=extra_storage_types,
-            observation_dtype=observation_dtype,
-            terminal_dtype=terminal_dtype,
-            action_shape=action_shape,
-            action_dtype=action_dtype,
-            reward_shape=reward_shape,
-            reward_dtype=reward_dtype,
         )
-
+        self._max_sample_attempts = max_sample_attempts
         self.sum_tree = sum_tree.SumTree(replay_capacity)
 
-    def get_add_args_signature(self):
-        """The signature of the add function.
-        The signature is the same as the one for ReplayBuffer, with an
-        added priority.
-        Returns:
-          list of ReplayElements defining the type of the argument signature needed
-            by the add function.
-        """
-        parent_add_signature = super(
-            PrioritizedReplayBuffer, self
-        ).get_add_args_signature()
-        add_signature = parent_add_signature + [
-            ReplayElement("priority", (), np.float32)
-        ]
-        return add_signature
-
-    def _add(self, *args):
+    def _add(self, **kwargs):
         """Internal add method to add to the underlying memory arrays.
         The arguments need to match add_arg_signature.
         If priority is none, it is set to the maximum priority ever seen.
         Args:
-          *args: All the elements in a transition.
         """
-        self._check_args_length(*args)
+        self._check_args_length(**kwargs)
 
         # Use Schaul et al.'s (2015) scheme of setting the priority of new elements
         # to the maximum priority so far.
         # Picks out 'priority' from arguments and adds it to the sum_tree.
         transition = {}
-        for i, element in enumerate(self.get_add_args_signature()):
+        for element in self.get_add_args_signature():
             if element.name == "priority":
-                priority = args[i]
+                priority = kwargs[element.name]
             else:
-                transition[element.name] = args[i]
+                transition[element.name] = element.metadata.input_to_storage(
+                    kwargs[element.name]
+                )
 
         self.sum_tree.set(self.cursor(), priority)
         super(PrioritizedReplayBuffer, self)._add_transition(transition)
 
-    def sample_index_batch(self, batch_size):
+    def sample_index_batch(self, batch_size: int) -> torch.Tensor:
         """Returns a batch of valid indices sampled as in Schaul et al. (2015).
         Args:
           batch_size: int, number of indices returned.
         Returns:
-          list of ints, a batch of valid indices sampled uniformly.
+          1D tensor of ints, a batch of valid indices sampled uniformly.
         Raises:
           Exception: If the batch was not constructed after maximum number of tries.
         """
+        # TODO: do priority sampling with torch as well.
         # Sample stratified indices. Some of them might be invalid.
         indices = self.sum_tree.stratified_sample(batch_size)
         allowed_attempts = self._max_sample_attempts
@@ -155,7 +110,7 @@ class PrioritizedReplayBuffer(circular_replay_buffer.ReplayBuffer):
                     index = self.sum_tree.sample()
                     allowed_attempts -= 1
                 indices[i] = index
-        return np.array(indices)
+        return torch.tensor(indices, dtype=torch.int64)
 
     def sample_transition_batch(self, batch_size=None, indices=None):
         """Returns a batch of transitions with extra storage and the priorities.
@@ -165,7 +120,7 @@ class PrioritizedReplayBuffer(circular_replay_buffer.ReplayBuffer):
         Args:
           batch_size: int, number of transitions returned. If None, the default
             batch_size will be used.
-          indices: None or list of ints, the indices of every transition in the
+          indices: None or 1D tensor of ints, the indices of every transition in the
             batch. If None, sample the indices uniformly.
         Returns:
           transition_batch: tuple of np.arrays with the shape and type as in
@@ -174,15 +129,20 @@ class PrioritizedReplayBuffer(circular_replay_buffer.ReplayBuffer):
         transition = super(PrioritizedReplayBuffer, self).sample_transition_batch(
             batch_size, indices
         )
-        transition_elements = self.get_transition_elements(batch_size)
-        transition_names = [e.name for e in transition_elements]
-        probabilities_index = transition_names.index("sampling_probabilities")
-        indices_index = transition_names.index("indices")
-        indices = transition[indices_index]
         # The parent returned an empty array for the probabilities. Fill it with the
-        # contents of the sum tree.
-        transition[probabilities_index][:] = self.get_priority(indices)
-        return transition
+        # contents of the sum tree. Note scalar values are returned as (batch_size, 1).
+
+        batch_arrays = []
+        for element_name in self._transition_elements:
+            if element_name == "sampling_probabilities":
+                batch = torch.from_numpy(
+                    self.get_priority(transition.indices.numpy().astype(np.int32))
+                ).view(batch_size, 1)
+            else:
+                batch = getattr(transition, element_name)
+            batch_arrays.append(batch)
+
+        return self._batch_type(*batch_arrays)
 
     def set_priority(self, indices, priorities):
         """Sets the priority of the given elements according to Schaul et al.
@@ -216,18 +176,8 @@ class PrioritizedReplayBuffer(circular_replay_buffer.ReplayBuffer):
             priority_batch[i] = self.sum_tree.get(memory_index)
         return priority_batch
 
-    def get_transition_elements(self, batch_size=None):
-        """Returns a 'type signature' for sample_transition_batch.
-        Args:
-          batch_size: int, number of transitions returned. If None, the default
-            batch_size will be used.
-        Returns:
-          signature: A namedtuple describing the method's return type signature.
-        """
-        parent_transition_type = super(
+    def get_transition_elements(self):
+        parent_transition_elements = super(
             PrioritizedReplayBuffer, self
-        ).get_transition_elements(batch_size)
-        probablilities_type = [
-            ReplayElement("sampling_probabilities", (batch_size,), np.float32)
-        ]
-        return parent_transition_type + probablilities_type
+        ).get_transition_elements()
+        return parent_transition_elements + ["sampling_probabilities"]

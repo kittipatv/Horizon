@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 # Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 from io import BytesIO
+from typing import Dict
 
+import numpy as np
 import torch
+
+
+def dict_to_tensor(batch: Dict[str, np.ndarray], device: str = "cpu"):
+    return {k: torch.tensor(v).to(device) for k, v in batch.items()}
 
 
 def rescale_torch_tensor(
@@ -63,3 +69,25 @@ def masked_softmax(x, mask, temperature):
     # Set NaN values to 0 (NaN happens when a full mask row is passed in)
     out[out != out] = 0
     return out
+
+
+def gather(data, index_2d):
+    """
+    Gather data alongs the second dim. Assume data's shape as (batch_size, dim1, dim2, ...),
+    and index_2d's shape is (batch_size, dim1).
+    output[i][j] = data[i][index_2d[i][j]]
+
+    This function does not require data, output, or index_2d having the same shape, which
+     is mandated by torch.gather.
+    """
+    batch_size = data.shape[0]
+    data_shape = data.shape[2:]
+    index_len = index_2d.shape[1]
+    device = data.device
+    res = data[
+        torch.arange(batch_size, device=device).repeat_interleave(
+            torch.tensor(index_len, device=device)
+        ),
+        index_2d.flatten(),
+    ].view(batch_size, index_len, *data_shape)
+    return res

@@ -1,306 +1,344 @@
 #!/usr/bin/env python3
 # Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
-"""
-Environments that require short training and evaluation time (<=10min)
-can be tested in this file.
-"""
-import json
 import logging
-import random
+import os
+import pprint
 import unittest
 from typing import Optional
 
-import gym
 import numpy as np
+import pytest
+import pytorch_lightning as pl
 import torch
+from parameterized import parameterized
 from reagent.gym.agents.agent import Agent
-from reagent.gym.agents.replay_buffer_add_fn import replay_buffer_add_fn
-from reagent.gym.agents.replay_buffer_train_fn import replay_buffer_train_fn
+from reagent.gym.agents.post_episode import train_post_episode
+from reagent.gym.agents.post_step import train_with_replay_buffer_post_step
+from reagent.gym.datasets.replay_buffer_dataset import ReplayBufferDataset
+from reagent.gym.envs import Env__Union
+from reagent.gym.envs.env_wrapper import EnvWrapper
+from reagent.gym.envs.gym import Gym
 from reagent.gym.policies.policy import Policy
-from reagent.gym.policies.samplers.continuous_sampler import GaussianSampler
-from reagent.gym.policies.samplers.discrete_sampler import SoftmaxActionSampler
-from reagent.gym.policies.scorers.continuous_scorer import sac_scorer
-from reagent.gym.policies.scorers.discrete_scorer import (
-    discrete_dqn_scorer,
-    parametric_dqn_scorer,
-)
-from reagent.gym.preprocessors.action_preprocessors.action_preprocessor import (
-    continuous_action_preprocessor,
-    discrete_action_preprocessor,
-)
-from reagent.gym.preprocessors.policy_preprocessors.policy_preprocessor import (
-    numpy_policy_preprocessor,
-    tiled_numpy_policy_preprocessor,
-)
-from reagent.gym.preprocessors.trainer_preprocessors.trainer_preprocessor import (
-    discrete_dqn_trainer_preprocessor,
-    parametric_dqn_trainer_preprocessor,
-    sac_trainer_preprocessor,
-)
-from reagent.gym.runners.gymrunner import run_episode
-from reagent.json_serialize import from_json
-from reagent.replay_memory.circular_replay_buffer import ReplayBuffer, ReplayElement
-from reagent.tensorboardX import SummaryWriterContext
-from reagent.test.gym.open_ai_gym_environment import OpenAIGymEnvironment
-from reagent.test.gym.run_gym import OpenAiGymParameters, create_trainer
+from reagent.gym.runners.gymrunner import evaluate_for_n_episodes, run_episode
+from reagent.gym.types import PostEpisode, PostStep
+from reagent.gym.utils import build_normalizer, fill_replay_buffer
+from reagent.replay_memory.circular_replay_buffer import ReplayBuffer
+from reagent.tensorboardX import summary_writer_context
+from reagent.test.base.horizon_test_base import HorizonTestBase
+from reagent.training.trainer import Trainer
+from reagent.workflow.model_managers.union import ModelManager__Union
+from reagent.workflow.types import RewardOptions
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import trange
 
 
-DISCRETE_DQN_CARTPOLE_JSON = "reagent/test/gym/discrete_dqn_cartpole_v0.json"
-DISCRETE_DQN_CARTPOLE_NUM_EPISODES = 50
-PARAMETRIC_DQN_CARTPOLE_JSON = "reagent/test/gym/parametric_dqn_cartpole_v0.json"
-PARAMETRIC_DQN_CARTPOLE_NUM_EPISODES = 50
-# Though maximal score is 200, we set a lower bar to let tests finish in time
-CARTPOLE_SCORE_BAR = 100
-
-SAC_PENDULUM_JSON = "reagent/test/gym/sac_pendulum_v0.json"
-SAC_PENDULUM_NUM_EPISODES = 50
-# Though maximal score is 0, we set lower bar to let tests finish in time
-PENDULUM_SCORE_BAR = -750
-
+# for seeding the environment
 SEED = 0
+# exponential moving average parameter for tracking reward progress
+REWARD_DECAY = 0.8
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
-def extract_config(config_path: str) -> OpenAiGymParameters:
-    with open(config_path, "r") as f:
-        json_data = json.loads(f.read())
-        json_data["evaluation"] = {
-            "calc_cpe_in_training": False
-        }  # Slow without disabling
-        json_data["use_gpu"] = False
-
-    return from_json(json_data, OpenAiGymParameters)
-
-
-def build_trainer(config):
-    return create_trainer(config, OpenAIGymEnvironment(config.env))
-
-
-def run(env: gym.Env, agent: Agent, num_episodes: int, max_steps: Optional[int] = None):
-    reward_history = []
-    for i in range(num_episodes):
-        print(f"running episode {i}")
-        ep_reward = run_episode(env, agent, max_steps)
-        reward_history.append(ep_reward)
-    return reward_history
-
-
-def run_discrete_dqn_cartpole(config):
-    trainer = build_trainer(config)
-    num_episodes = DISCRETE_DQN_CARTPOLE_NUM_EPISODES
-    env = gym.make(config.env)
-    wrapped_env = OpenAIGymEnvironment(config.env)
-    action_shape = np.array(wrapped_env.actions).shape
-    action_type = np.int32
-    replay_buffer = ReplayBuffer(
-        observation_shape=env.reset().shape,
-        stack_size=1,
-        replay_capacity=config.max_replay_memory_size,
-        batch_size=trainer.minibatch_size,
-        observation_dtype=np.float32,
-        action_shape=action_shape,
-        action_dtype=action_type,
-        reward_shape=(),
-        reward_dtype=np.float32,
-        extra_storage_types=[
-            ReplayElement("possible_actions_mask", action_shape, action_type),
-            ReplayElement("log_prob", (), np.float32),
-        ],
-    )
-
-    actions = wrapped_env.actions
-    normalization = wrapped_env.normalization
-    policy = Policy(
-        scorer=discrete_dqn_scorer(trainer.q_network),
-        sampler=SoftmaxActionSampler(),
-        policy_preprocessor=numpy_policy_preprocessor(),
-    )
-    agent = Agent(
-        policy=policy,
-        action_preprocessor=discrete_action_preprocessor,
-        replay_buffer=replay_buffer,
-        replay_buffer_add_fn=replay_buffer_add_fn,
-        replay_buffer_train_fn=replay_buffer_train_fn(
-            trainer=trainer,
-            trainer_preprocessor=discrete_dqn_trainer_preprocessor(
-                len(actions), normalization
-            ),
-            training_freq=config.run_details.train_every_ts,
-            batch_size=trainer.minibatch_size,
-            replay_burnin=config.run_details.train_after_ts,
-        ),
-    )
-
-    reward_history = run(
-        env=env,
-        agent=agent,
-        num_episodes=num_episodes,
-        max_steps=config.run_details.max_steps,
-    )
-    return reward_history
+"""
+Put on-policy gym tests here in the format (test name, path to yaml config).
+Format path to be: "configs/<env_name>/<model_name>_<env_name>_online.yaml."
+NOTE: These tests should ideally finish quickly (within 10 minutes) since they are
+unit tests which are run many times.
+"""
+GYM_TESTS = [
+    ("Discrete DQN Cartpole", "configs/cartpole/discrete_dqn_cartpole_online.yaml"),
+    ("Discrete C51 Cartpole", "configs/cartpole/discrete_c51_cartpole_online.yaml"),
+    ("Discrete QR Cartpole", "configs/cartpole/discrete_qr_cartpole_online.yaml"),
+    (
+        "Discrete DQN Open Gridworld",
+        "configs/open_gridworld/discrete_dqn_open_gridworld.yaml",
+    ),
+    ("SAC Pendulum", "configs/pendulum/sac_pendulum_online.yaml"),
+    ("TD3 Pendulum", "configs/pendulum/td3_pendulum_online.yaml"),
+    ("Parametric DQN Cartpole", "configs/cartpole/parametric_dqn_cartpole_online.yaml"),
+    (
+        "Parametric SARSA Cartpole",
+        "configs/cartpole/parametric_sarsa_cartpole_online.yaml",
+    ),
+    (
+        "Sparse DQN Changing Arms",
+        "configs/sparse/discrete_dqn_changing_arms_online.yaml",
+    ),
+    ("SlateQ RecSim", "configs/recsim/slate_q_recsim_online.yaml"),
+    ("PossibleActionsMask DQN", "configs/functionality/dqn_possible_actions_mask.yaml"),
+]
 
 
-def run_parametric_dqn_cartpole(config):
-    trainer = build_trainer(config)
-    num_episodes = PARAMETRIC_DQN_CARTPOLE_NUM_EPISODES
-    env = gym.make(config.env)
-    wrapped_env = OpenAIGymEnvironment(config.env)
-    action_shape = np.array(wrapped_env.actions).shape
-    action_type = np.float32
-    replay_buffer = ReplayBuffer(
-        observation_shape=env.reset().shape,
-        stack_size=1,
-        replay_capacity=config.max_replay_memory_size,
-        batch_size=trainer.minibatch_size,
-        observation_dtype=np.float32,
-        action_shape=action_shape,
-        action_dtype=action_type,
-        reward_shape=(),
-        reward_dtype=np.float32,
-        extra_storage_types=[
-            ReplayElement("possible_actions_mask", action_shape, action_type),
-            ReplayElement("log_prob", (), np.float32),
-        ],
-    )
-
-    actions = wrapped_env.actions
-    normalization = wrapped_env.normalization
-
-    policy = Policy(
-        scorer=parametric_dqn_scorer(len(actions), trainer.q_network),
-        sampler=SoftmaxActionSampler(),
-        policy_preprocessor=tiled_numpy_policy_preprocessor(len(actions)),
-    )
-    agent = Agent(
-        policy=policy,
-        action_preprocessor=discrete_action_preprocessor,
-        replay_buffer=replay_buffer,
-        replay_buffer_add_fn=replay_buffer_add_fn,
-        replay_buffer_train_fn=replay_buffer_train_fn(
-            trainer=trainer,
-            trainer_preprocessor=parametric_dqn_trainer_preprocessor(
-                len(actions), normalization
-            ),
-            training_freq=config.run_details.train_every_ts,
-            batch_size=trainer.minibatch_size,
-            replay_burnin=config.run_details.train_after_ts,
-        ),
-    )
-
-    reward_history = run(
-        env=env,
-        agent=agent,
-        num_episodes=num_episodes,
-        max_steps=config.run_details.max_steps,
-    )
-    return reward_history
+curr_dir = os.path.dirname(__file__)
 
 
-def run_sac_pendulum(config):
-    trainer = build_trainer(config)
-    num_episodes = SAC_PENDULUM_NUM_EPISODES
-    env = gym.make(config.env)
-    action_shape = (1,)
-    action_type = np.float32
-    replay_buffer = ReplayBuffer(
-        observation_shape=env.reset().shape,
-        stack_size=1,
-        replay_capacity=config.max_replay_memory_size,
-        batch_size=trainer.minibatch_size,
-        observation_dtype=np.float32,
-        action_shape=action_shape,
-        action_dtype=action_type,
-        reward_shape=(),
-        reward_dtype=np.float32,
-        extra_storage_types=[
-            ReplayElement("possible_actions_mask", action_shape, action_type),
-            ReplayElement("log_prob", (), np.float32),
-        ],
-    )
+class TestGym(HorizonTestBase):
+    # pyre-fixme[16]: Module `parameterized` has no attribute `expand`.
+    @parameterized.expand(GYM_TESTS)
+    def test_gym_cpu(self, name: str, config_path: str):
+        logger.info(f"Starting {name} on CPU")
+        self.run_from_config(
+            run_test=run_test,
+            config_path=os.path.join(curr_dir, config_path),
+            use_gpu=False,
+        )
+        logger.info(f"{name} passes!")
 
-    policy = Policy(
-        scorer=sac_scorer(trainer.actor_network),
-        sampler=GaussianSampler(
-            trainer.actor_network,
-            trainer.min_action_range_tensor_serving,
-            trainer.max_action_range_tensor_serving,
-            trainer.min_action_range_tensor_training,
-            trainer.max_action_range_tensor_training,
-        ),
-        policy_preprocessor=numpy_policy_preprocessor(),
-    )
-    agent = Agent(
-        policy=policy,
-        action_preprocessor=continuous_action_preprocessor,
-        replay_buffer=replay_buffer,
-        replay_buffer_add_fn=replay_buffer_add_fn,
-        replay_buffer_train_fn=replay_buffer_train_fn(
-            trainer=trainer,
-            trainer_preprocessor=sac_trainer_preprocessor(),
-            training_freq=config.run_details.train_every_ts,
-            batch_size=trainer.minibatch_size,
-            replay_burnin=config.run_details.train_after_ts,
-        ),
-    )
+    # pyre-fixme[16]: Module `parameterized` has no attribute `expand`.
+    @parameterized.expand(GYM_TESTS)
+    @pytest.mark.serial
+    # pyre-fixme[56]: Argument `not torch.cuda.is_available()` to decorator factory
+    #  `unittest.skipIf` could not be resolved in a global scope.
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
+    def test_gym_gpu(self, name: str, config_path: str):
+        logger.info(f"Starting {name} on GPU")
+        self.run_from_config(
+            run_test=run_test,
+            config_path=os.path.join(curr_dir, config_path),
+            use_gpu=True,
+        )
+        logger.info(f"{name} passes!")
 
-    reward_history = run(
-        env=env,
-        agent=agent,
-        num_episodes=num_episodes,
-        max_steps=config.run_details.max_steps,
-    )
-    return reward_history
+    def test_cartpole_reinforce(self):
+        # TODO(@badri) Parameterize this test
+        env = Gym("CartPole-v0")
+        norm = build_normalizer(env)
 
+        from reagent.net_builder.discrete_dqn.fully_connected import FullyConnected
 
-class TestGym(unittest.TestCase):
-    def setUp(self):
-        logging.getLogger().setLevel(logging.INFO)
-        SummaryWriterContext._reset_globals()
-        np.random.seed(SEED)
-        torch.manual_seed(SEED)
-        random.seed(SEED)
-
-    def test_discrete_dqn_cartpole(self):
-        config = extract_config(DISCRETE_DQN_CARTPOLE_JSON)
-        self.assertTrue(config.model_type == "pytorch_discrete_dqn")
-        reward_history = run_discrete_dqn_cartpole(config)
-        self.assertTrue(
-            reward_history[-1] >= CARTPOLE_SCORE_BAR,
-            "reward after %d episodes is %f < %f...\nFull reward history: %s"
-            % (
-                len(reward_history),
-                reward_history[-1],
-                CARTPOLE_SCORE_BAR,
-                reward_history,
-            ),
+        net_builder = FullyConnected(sizes=[8], activations=["linear"])
+        cartpole_scorer = net_builder.build_q_network(
+            state_feature_config=None,
+            state_normalization_data=norm["state"],
+            output_dim=len(norm["action"].dense_normalization_parameters),
         )
 
-    @unittest.skip("Skipping since training takes more than 10 min.")
-    def test_parametric_dqn_cartpole(self):
-        config = extract_config(PARAMETRIC_DQN_CARTPOLE_JSON)
-        self.assertTrue(config.model_type == "pytorch_parametric_dqn")
-        reward_history = run_parametric_dqn_cartpole(config)
-        self.assertTrue(
-            reward_history[-1] >= CARTPOLE_SCORE_BAR,
-            "reward after %d episodes is %f < %f\nFull reward history: %s"
-            % (
-                len(reward_history),
-                reward_history[-1],
-                CARTPOLE_SCORE_BAR,
-                reward_history,
+        from reagent.gym.policies.samplers.discrete_sampler import SoftmaxActionSampler
+
+        policy = Policy(scorer=cartpole_scorer, sampler=SoftmaxActionSampler())
+
+        from reagent.training.reinforce import Reinforce, ReinforceParams
+        from reagent.optimizer.union import classes
+
+        trainer = Reinforce(
+            policy,
+            ReinforceParams(
+                gamma=0.995, optimizer=classes["Adam"](lr=5e-3, weight_decay=1e-3)
             ),
+        )
+        run_test_episode_buffer(
+            env,
+            policy,
+            trainer,
+            num_train_episodes=500,
+            passing_score_bar=180,
+            num_eval_episodes=100,
         )
 
-    @unittest.skip("Skipping since training takes more than 10 min.")
-    def test_sac_pendulum(self):
-        config = extract_config(SAC_PENDULUM_JSON)
-        self.assertTrue(config.model_type == "soft_actor_critic")
-        reward_history = run_sac_pendulum(config)
-        self.assertTrue(
-            reward_history[-1] >= PENDULUM_SCORE_BAR,
-            "reward after %d episodes is %f < %f\nFull reward history: %s"(
-                len(reward_history),
-                reward_history[-1],
-                PENDULUM_SCORE_BAR,
-                reward_history,
-            ),
+
+def train_policy(
+    env: EnvWrapper,
+    training_policy: Policy,
+    num_train_episodes: int,
+    post_step: Optional[PostStep] = None,
+    post_episode: Optional[PostEpisode] = None,
+    use_gpu: bool = False,
+) -> np.ndarray:
+    device = torch.device("cuda") if use_gpu else torch.device("cpu")
+    agent = Agent.create_for_env(
+        env,
+        policy=training_policy,
+        post_transition_callback=post_step,
+        post_episode_callback=post_episode,
+        device=device,
+    )
+    running_reward = 0
+    writer = SummaryWriter()
+    with summary_writer_context(writer):
+        train_rewards = []
+        with trange(num_train_episodes, unit=" epoch") as t:
+            for i in t:
+                trajectory = run_episode(env=env, agent=agent, mdp_id=i, max_steps=200)
+                ep_reward = trajectory.calculate_cumulative_reward()
+                train_rewards.append(ep_reward)
+                running_reward *= REWARD_DECAY
+                running_reward += (1 - REWARD_DECAY) * ep_reward
+                t.set_postfix(reward=running_reward)
+
+    logger.info("============Train rewards=============")
+    logger.info(train_rewards)
+    logger.info(f"average: {np.mean(train_rewards)};\tmax: {np.max(train_rewards)}")
+    return np.array(train_rewards)
+
+
+def eval_policy(
+    env: EnvWrapper,
+    serving_policy: Policy,
+    num_eval_episodes: int,
+    serving: bool = True,
+) -> np.ndarray:
+    agent = (
+        Agent.create_for_env_with_serving_policy(env, serving_policy)
+        if serving
+        else Agent.create_for_env(env, serving_policy)
+    )
+
+    eval_rewards = evaluate_for_n_episodes(
+        n=num_eval_episodes, env=env, agent=agent, max_steps=env.max_steps
+    ).squeeze(1)
+
+    logger.info("============Eval rewards==============")
+    logger.info(eval_rewards)
+    mean_eval = np.mean(eval_rewards)
+    logger.info(f"average: {mean_eval};\tmax: {np.max(eval_rewards)}")
+    return np.array(eval_rewards)
+
+
+def identity_collate(batch):
+    assert isinstance(batch, list) and len(batch) == 1, f"Got {batch}"
+    return batch[0]
+
+
+def run_test(
+    env: Env__Union,
+    model: ModelManager__Union,
+    replay_memory_size: int,
+    train_every_ts: int,
+    train_after_ts: int,
+    num_train_episodes: int,
+    passing_score_bar: float,
+    num_eval_episodes: int,
+    use_gpu: bool,
+    minibatch_size: Optional[int] = None,
+):
+    env = env.value
+
+    normalization = build_normalizer(env)
+    logger.info(f"Normalization is: \n{pprint.pformat(normalization)}")
+
+    manager = model.value
+    trainer = manager.initialize_trainer(
+        use_gpu=use_gpu,
+        reward_options=RewardOptions(),
+        normalization_data_map=normalization,
+    )
+    training_policy = manager.create_policy(serving=False)
+
+    # pyre-fixme[16]: Module `pl` has no attribute `LightningModule`.
+    if not isinstance(trainer, pl.LightningModule):
+        if minibatch_size is None:
+            minibatch_size = trainer.minibatch_size
+        assert minibatch_size == trainer.minibatch_size
+
+    assert minibatch_size is not None
+
+    replay_buffer = ReplayBuffer(
+        replay_capacity=replay_memory_size, batch_size=minibatch_size
+    )
+
+    device = torch.device("cuda") if use_gpu else torch.device("cpu")
+    # first fill the replay buffer to burn_in
+    train_after_ts = max(train_after_ts, minibatch_size)
+    fill_replay_buffer(
+        env=env, replay_buffer=replay_buffer, desired_size=train_after_ts
+    )
+
+    # pyre-fixme[16]: Module `pl` has no attribute `LightningModule`.
+    if isinstance(trainer, pl.LightningModule):
+        agent = Agent.create_for_env(env, policy=training_policy)
+        # TODO: Simplify this setup by creating LightningDataModule
+        dataset = ReplayBufferDataset.create_for_trainer(
+            trainer,
+            env,
+            agent,
+            replay_buffer,
+            batch_size=minibatch_size,
+            training_frequency=train_every_ts,
+            num_episodes=num_train_episodes,
+            max_steps=200,
         )
+        data_loader = torch.utils.data.DataLoader(dataset, collate_fn=identity_collate)
+        # pyre-fixme[16]: Module `pl` has no attribute `Trainer`.
+        pl_trainer = pl.Trainer(max_epochs=1, gpus=int(use_gpu))
+        pl_trainer.fit(trainer, data_loader)
+
+        # TODO: Also check train_reward
+    else:
+        post_step = train_with_replay_buffer_post_step(
+            replay_buffer=replay_buffer,
+            env=env,
+            trainer=trainer,
+            training_freq=train_every_ts,
+            batch_size=trainer.minibatch_size,
+            device=device,
+        )
+
+        env.seed(SEED)
+        env.action_space.seed(SEED)
+
+        train_rewards = train_policy(
+            env,
+            training_policy,
+            num_train_episodes,
+            post_step=post_step,
+            post_episode=None,
+            use_gpu=use_gpu,
+        )
+
+        # Check whether the max score passed the score bar; we explore during training
+        # the return could be bad (leading to flakiness in C51 and QRDQN).
+        assert np.max(train_rewards) >= passing_score_bar, (
+            f"max reward ({np.max(train_rewards)}) after training for "
+            f"{len(train_rewards)} episodes is less than < {passing_score_bar}.\n"
+        )
+
+    serving_policy = manager.create_policy(serving=True)
+
+    eval_rewards = eval_policy(env, serving_policy, num_eval_episodes, serving=True)
+    assert (
+        eval_rewards.mean() >= passing_score_bar
+    ), f"Eval reward is {eval_rewards.mean()}, less than < {passing_score_bar}.\n"
+
+
+def run_test_episode_buffer(
+    env: EnvWrapper,
+    policy: Policy,
+    trainer: Trainer,
+    num_train_episodes: int,
+    passing_score_bar: float,
+    num_eval_episodes: int,
+    use_gpu: bool = False,
+):
+    training_policy = policy
+
+    post_episode_callback = train_post_episode(env, trainer, use_gpu)
+
+    env.seed(SEED)
+    env.action_space.seed(SEED)
+
+    train_rewards = train_policy(
+        env,
+        training_policy,
+        num_train_episodes,
+        post_step=None,
+        post_episode=post_episode_callback,
+        use_gpu=use_gpu,
+    )
+
+    # Check whether the max score passed the score bar; we explore during training
+    # the return could be bad (leading to flakiness in C51 and QRDQN).
+    assert np.max(train_rewards) >= passing_score_bar, (
+        f"max reward ({np.max(train_rewards)}) after training for "
+        f"{len(train_rewards)} episodes is less than < {passing_score_bar}.\n"
+    )
+
+    serving_policy = policy
+    eval_rewards = eval_policy(env, serving_policy, num_eval_episodes, serving=False)
+    assert (
+        eval_rewards.mean() >= passing_score_bar
+    ), f"Eval reward is {eval_rewards.mean()}, less than < {passing_score_bar}.\n"
+
+
+if __name__ == "__main__":
+    unittest.main()

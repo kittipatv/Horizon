@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 
+import math
 from collections import OrderedDict
 from typing import Sequence, Union
 
 import numpy as np
 import torch
+
+
+DEFAULT_MIN = float("-inf")
+DEFAULT_MAX = float("inf")
 
 
 def convert_to_one_hots(a, num_classes: int, dtype=torch.int, device=None):
@@ -42,13 +47,16 @@ class LRUCache(OrderedDict):
 
 
 class RunningAverage:
-    def __init__(self):
-        self._average = 0.0
-        self._count = 0
+    def __init__(self, init_val: float = float("nan")):
+        self._average = init_val
+        self._count = 0 if math.isnan(init_val) else 1
 
     def add(self, value) -> "RunningAverage":
-        self._count += 1
-        self._average = self._average + (float(value) - self._average) / self._count
+        if not math.isnan(value) and not math.isinf(value):
+            if self._count == 0:
+                self._average = 0.0
+            self._count += 1
+            self._average = self._average + (float(value) - self._average) / self._count
         return self
 
     @property
@@ -63,11 +71,14 @@ class RunningAverage:
     def total(self):
         return self._average * self._count
 
+    def __float__(self):
+        return self._average
+
 
 class Clamper:
-    def __init__(self, min: float = None, max: float = None):
-        self._min = min if min is not None else float("-inf")
-        self._max = max if max is not None else float("inf")
+    def __init__(self, min_v: float = DEFAULT_MIN, max_v: float = DEFAULT_MAX):
+        self._min = min_v
+        self._max = max_v
         if self._min >= self._max:
             raise ValueError(f"min[{min}] greater than max[{max}]")
 
@@ -82,3 +93,6 @@ class Clamper:
             return [max(self._min, min(self._max, float(i))) for i in v]
         else:
             return max(self._min, min(self._max, float(v)))
+
+    def __repr__(self):
+        return f"Clamper({self._min},{self._max})"

@@ -5,12 +5,9 @@ from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
+from reagent.parameters import NormalizationParameters
 from reagent.preprocessing.identify_types import CONTINUOUS_ACTION, DO_NOT_PREPROCESS
-from reagent.preprocessing.normalization import (
-    EPS,
-    NormalizationParameters,
-    get_num_output_features,
-)
+from reagent.preprocessing.normalization import EPS, get_num_output_features
 
 
 class Postprocessor(nn.Module):
@@ -25,7 +22,6 @@ class Postprocessor(nn.Module):
     ) -> None:
         super().__init__()
         self.num_output_features = get_num_output_features(normalization_parameters)
-
         feature_types = {
             norm_param.feature_type for norm_param in normalization_parameters.values()
         }
@@ -36,34 +32,39 @@ class Postprocessor(nn.Module):
         assert self.feature_type in {
             CONTINUOUS_ACTION,
             DO_NOT_PREPROCESS,
-        }, "Only support CONTINUOUS_ACTION & DO_NOT_PREPROCESS"
+        }, f"{self.feature_type} is not CONTINUOUS_ACTION & DO_NOT_PREPROCESS"
 
-        self.device = torch.device("cuda" if use_gpu else "cpu")  # type: ignore
+        self.device = torch.device("cuda" if use_gpu else "cpu")
 
         if self.feature_type == CONTINUOUS_ACTION:
             sorted_features = sorted(normalization_parameters.keys())
             self.min_serving_value = torch.tensor(
                 [normalization_parameters[f].min_value for f in sorted_features],
                 device=self.device,
-            )
+            ).float()
             self.scaling_factor = torch.tensor(
                 [
                     (
-                        normalization_parameters[f].max_value  # type: ignore
-                        - normalization_parameters[f].min_value  # type: ignore
+                        # pyre-fixme[58]: `-` is not supported for operand types
+                        #  `Optional[float]` and `Optional[float]`.
+                        normalization_parameters[f].max_value
+                        - normalization_parameters[f].min_value
                     )
                     / (2 * (1 - EPS))
                     for f in sorted_features
                 ],
                 device=self.device,
-            )
+            ).float()
+            self.almost_one = torch.tensor(1.0 - EPS, device=self.device).float()
 
     def input_prototype(self) -> Tuple[torch.Tensor]:
         return (torch.randn(1, self.num_output_features),)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if self.feature_type == CONTINUOUS_ACTION:
-            return (  # type: ignore
-                torch.clamp(input, -1 + EPS, 1 - EPS) + 1 - EPS
+            # Please don't re-order; ONNX messed up tensor type when torch.clamp is
+            # the first operand.
+            return (
+                self.almost_one + torch.clamp(input, -self.almost_one, self.almost_one)
             ) * self.scaling_factor + self.min_serving_value
         return input

@@ -69,13 +69,16 @@ class DQNTrainerBase(RLTrainer):
         else:
             return self.get_max_q_values(q_values_target, possible_actions_mask)
 
-    @torch.no_grad()  # type: ignore
+    # pyre-fixme[56]: Decorator `torch.no_grad(...)` could not be called, because
+    #  its type `no_grad` is not callable.
+    @torch.no_grad()
     def boost_rewards(
         self, rewards: torch.Tensor, actions: torch.Tensor
     ) -> torch.Tensor:
         # Apply reward boost if specified
         reward_boosts = torch.sum(
-            actions.float() * self.reward_boosts,  # type: ignore
+            # pyre-fixme[16]: `DQNTrainerBase` has no attribute `reward_boosts`.
+            actions.float() * self.reward_boosts,
             dim=1,
             keepdim=True,
         )

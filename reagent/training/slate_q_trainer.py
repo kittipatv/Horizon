@@ -2,29 +2,18 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 
 import logging
-from typing import List
+from typing import List, Optional
 
 import reagent.parameters as rlp
 import reagent.types as rlt
 import torch
-from reagent.core.dataclasses import dataclass, field
+import torch.nn.functional as F
+from reagent.core.dataclasses import field
+from reagent.optimizer.union import Optimizer__Union
 from reagent.training.dqn_trainer_base import DQNTrainerBase
 
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class SlateQTrainerParameters:
-    rl: rlp.RLParameters = field(
-        default_factory=lambda: rlp.RLParameters(maxq_learning=False)
-    )
-    optimizer: str = "ADAM"
-    learning_rate: float = 0.001
-    minibatch_size: int = 1024
-    evaluation: rlp.EvaluationParameters = field(
-        default_factory=lambda: rlp.EvaluationParameters(calc_cpe_in_training=False)
-    )
 
 
 class SlateQTrainer(DQNTrainerBase):
@@ -32,65 +21,70 @@ class SlateQTrainer(DQNTrainerBase):
         self,
         q_network,
         q_network_target,
-        parameters: SlateQTrainerParameters,
         use_gpu: bool = False,
+        # Start SlateQTrainerParameters
+        rl: rlp.RLParameters = field(  # noqa: B008
+            default_factory=lambda: rlp.RLParameters(maxq_learning=False)
+        ),
+        optimizer: Optimizer__Union = field(  # noqa: B008
+            default_factory=Optimizer__Union.default
+        ),
+        single_selection: bool = True,
+        minibatch_size: int = 1024,
+        evaluation: rlp.EvaluationParameters = field(  # noqa: B008
+            default_factory=lambda: rlp.EvaluationParameters(calc_cpe_in_training=False)
+        ),
     ) -> None:
-        super().__init__(parameters.rl, use_gpu=use_gpu)
+        super().__init__(rl, use_gpu=use_gpu)
         self.minibatches_per_step = 1
-        self.minibatch_size = parameters.minibatch_size
+        self.minibatch_size = minibatch_size
+        self.single_selection = single_selection
 
         self.q_network = q_network
         self.q_network_target = q_network_target
-        self._set_optimizer(parameters.optimizer)
-        self.q_network_optimizer = self.optimizer_func(
-            self.q_network.parameters(),
-            lr=parameters.learning_rate,
-            # weight_decay=parameters.training.l2_decay,
-        )
+        self.q_network_optimizer = optimizer.make_optimizer(self.q_network.parameters())
 
     def warm_start_components(self) -> List[str]:
         components = ["q_network", "q_network_target", "q_network_optimizer"]
         return components
 
-    @torch.no_grad()  # type: ignore
-    def get_detached_q_values_target(
+    def _action_docs(
         self,
-        tiled_state: rlt.PreprocessedTiledFeatureVector,
-        action: rlt.PreprocessedSlateFeatureVector,
-    ) -> torch.Tensor:
-        """ Gets the q values from the target network """
-        return self.get_slate_q_value(self.q_network_target, tiled_state, action)
+        state: rlt.FeatureData,
+        action: torch.Tensor,
+        terminal_mask: Optional[torch.Tensor] = None,
+    ) -> rlt.DocList:
+        # for invalid indices, simply set action to 0 so we can batch index still
+        if terminal_mask is not None:
+            assert terminal_mask.shape == (
+                action.shape[0],
+            ), f"{terminal_mask.shape} != 0th dim of {action.shape}"
+            action[terminal_mask] = torch.zeros_like(action[terminal_mask])
+        docs = state.candidate_docs
+        assert docs is not None
+        return docs.select_slate(action)
 
-    def get_slate_q_value(
-        self,
-        q_network,
-        tiled_state: rlt.PreprocessedTiledFeatureVector,
-        action: rlt.PreprocessedSlateFeatureVector,
+    def _get_unmasked_q_values(
+        self, q_network, state: rlt.FeatureData, slate: rlt.DocList
     ) -> torch.Tensor:
         """ Gets the q values from the model and target networks """
-        input = rlt.PreprocessedStateAction(
-            state=tiled_state.as_preprocessed_feature_vector(),
-            action=action.as_preprocessed_feature_vector(),
-        )
-        q_value = self.q_network_target(input).q_value
-        q_value = (
-            q_value.view(action.float_features.shape[0], action.float_features.shape[1])
-            * action.item_mask
-            * action.item_probability
-        )
-        return q_value.sum(dim=1, keepdim=True)
+        batch_size, slate_size, _ = slate.float_features.shape
+        # TODO: Probably should create a new model type
+        return q_network(
+            state.repeat_interleave(slate_size, dim=0), slate.as_feature_data()
+        ).view(batch_size, slate_size)
 
-    @torch.no_grad()  # type: ignore
-    def train(self, training_batch: rlt.PreprocessedTrainingBatch):
-        learning_input = training_batch.training_input
+    # pyre-fixme[56]: Decorator `torch.no_grad(...)` could not be called, because
+    #  its type `no_grad` is not callable.
+    @torch.no_grad()
+    def train(self, training_batch: rlt.SlateQInput):
         assert isinstance(
-            learning_input, rlt.PreprocessedSlateQInput
-        ), f"learning input is a {type(learning_input)}"
+            training_batch, rlt.SlateQInput
+        ), f"learning input is a {type(training_batch)}"
         self.minibatch += 1
 
-        reward = learning_input.reward
-        reward_mask = learning_input.reward_mask
-        not_done_mask = learning_input.not_terminal
+        reward = training_batch.reward
+        reward_mask = training_batch.reward_mask
 
         discount_tensor = torch.full_like(reward, self.gamma)
 
@@ -98,24 +92,45 @@ class SlateQTrainer(DQNTrainerBase):
             raise NotImplementedError("Q-Learning for SlateQ is not implemented")
         else:
             # SARSA (Use the target network)
-            next_q_values = self.get_detached_q_values_target(
-                learning_input.tiled_next_state, learning_input.next_action
+            terminal_mask = (
+                training_batch.not_terminal.to(torch.bool) == False
+            ).squeeze(1)
+            next_action_docs = self._action_docs(
+                training_batch.next_state,
+                training_batch.next_action,
+                terminal_mask=terminal_mask,
+            )
+            value = next_action_docs.value
+            if self.single_selection:
+                value = F.softmax(value, dim=1)
+            next_q_values = torch.sum(
+                self._get_unmasked_q_values(
+                    self.q_network_target, training_batch.next_state, next_action_docs
+                )
+                * value,
+                dim=1,
+                keepdim=True,
             )
 
-        filtered_max_q_vals = next_q_values * not_done_mask.float()
+        # If not single selection, divide max-Q by N
+        if not self.single_selection:
+            _batch_size, slate_size = reward.shape
+            next_q_values = next_q_values / slate_size
 
+        filtered_max_q_vals = next_q_values * training_batch.not_terminal.float()
         target_q_values = reward + (discount_tensor * filtered_max_q_vals)
-        target_q_values = target_q_values[reward_mask]
+        # Don't mask if not single selection
+        if self.single_selection:
+            target_q_values = target_q_values[reward_mask]
 
         with torch.enable_grad():
             # Get Q-value of action taken
-            current_state_action = rlt.PreprocessedStateAction(
-                state=learning_input.tiled_state.as_preprocessed_feature_vector(),
-                action=learning_input.action.as_preprocessed_feature_vector(),
+            action_docs = self._action_docs(training_batch.state, training_batch.action)
+            q_values = self._get_unmasked_q_values(
+                self.q_network, training_batch.state, action_docs
             )
-            q_values = self.q_network(current_state_action).q_value.view(
-                *reward_mask.shape
-            )[reward_mask]
+            if self.single_selection:
+                q_values = q_values[reward_mask]
             all_action_scores = q_values.detach()
 
             value_loss = self.q_network_loss(q_values, target_q_values)
@@ -129,6 +144,9 @@ class SlateQTrainer(DQNTrainerBase):
         self._maybe_soft_update(
             self.q_network, self.q_network_target, self.tau, self.minibatches_per_step
         )
+
+        if not self.single_selection:
+            all_action_scores = all_action_scores.sum(dim=1, keepdim=True)
 
         self.loss_reporter.report(
             td_loss=td_loss, model_values_on_logged_actions=all_action_scores

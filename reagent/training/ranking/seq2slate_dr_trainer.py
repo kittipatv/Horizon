@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 # Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 import logging
-from typing import Optional
 
 import reagent.types as rlt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from reagent.models.seq2slate import (
-    BaselineNet,
+from reagent.core.dataclasses import field
+from reagent.model_utils.seq2slate_utils import (
     Seq2SlateMode,
-    Seq2SlateTransformerModel,
-    Seq2SlateTransformerNet,
+    per_symbol_to_per_seq_log_probs,
 )
-from reagent.parameters import Seq2SlateTransformerParameters
+from reagent.models.seq2slate import Seq2SlateTransformerModel, Seq2SlateTransformerNet
+from reagent.optimizer.union import Optimizer__Union
+from reagent.parameters import Seq2SlateParameters
+from reagent.training.ranking.helper import ips_clamp
 from reagent.training.trainer import Trainer
 
 
@@ -29,21 +30,22 @@ class Seq2SlateDifferentiableRewardTrainer(Trainer):
     def __init__(
         self,
         seq2slate_net: Seq2SlateTransformerNet,
-        parameters: Seq2SlateTransformerParameters,
+        parameters: Seq2SlateParameters,
         minibatch_size: int,
-        baseline_net: Optional[BaselineNet] = None,
         use_gpu: bool = False,
+        policy_optimizer: Optimizer__Union = field(  # noqa: B008
+            default_factory=Optimizer__Union.default
+        ),
+        print_interval: int = 100,
     ) -> None:
         self.parameters = parameters
         self.use_gpu = use_gpu
+        self.print_interval = print_interval
         self.seq2slate_net = seq2slate_net
-        self.baseline_net = baseline_net
         self.minibatch_size = minibatch_size
         self.minibatch = 0
-        self.optimizer = torch.optim.Adam(
-            self.seq2slate_net.parameters(),
-            lr=self.parameters.transformer.learning_rate,
-            amsgrad=True,
+        self.optimizer = policy_optimizer.make_optimizer(
+            self.seq2slate_net.parameters()
         )
         # TODO: T62269969 add baseline_net in training
         self.kl_div_loss = nn.KLDivLoss(reduction="none")
@@ -60,28 +62,28 @@ class Seq2SlateDifferentiableRewardTrainer(Trainer):
         per_symbol_log_probs = self.seq2slate_net(
             training_input, mode=Seq2SlateMode.PER_SYMBOL_LOG_PROB_DIST_MODE
         ).log_probs
-        per_seq_log_probs = Seq2SlateTransformerModel.per_symbol_to_per_seq_log_probs(
+        per_seq_log_probs = per_symbol_to_per_seq_log_probs(
             per_symbol_log_probs, training_input.tgt_out_idx
         )
         assert per_symbol_log_probs.requires_grad and per_seq_log_probs.requires_grad
+        # pyre-fixme[16]: `Optional` has no attribute `shape`.
         assert per_seq_log_probs.shape == training_input.tgt_out_probs.shape
 
         if not self.parameters.on_policy:
             importance_sampling = (
                 torch.exp(per_seq_log_probs) / training_input.tgt_out_probs
             )
-            if self.parameters.importance_sampling_clamp_max is not None:
-                importance_sampling = torch.clamp(
-                    importance_sampling,
-                    0,
-                    self.parameters.importance_sampling_clamp_max,
-                )
+            importance_sampling = ips_clamp(
+                importance_sampling, self.parameters.ips_clamp
+            )
         else:
             importance_sampling = (
                 torch.exp(per_seq_log_probs) / torch.exp(per_seq_log_probs).detach()
             )
         assert importance_sampling.requires_grad
 
+        # pyre-fixme[6]: Expected `Tensor` for 1st param but got
+        #  `Optional[torch.Tensor]`.
         labels = self._transform_label(training_input.tgt_out_idx)
         assert not labels.requires_grad
 
@@ -91,7 +93,7 @@ class Seq2SlateDifferentiableRewardTrainer(Trainer):
             torch.sum(self.kl_div_loss(per_symbol_log_probs, labels), dim=2)
             * training_input.position_reward
         )
-        # weighted_batch_loss shape: batch_size
+        # weighted_batch_loss shape: batch_size, 1
         weighted_batch_loss = torch.sum(
             1.0
             / torch.log(
@@ -100,6 +102,7 @@ class Seq2SlateDifferentiableRewardTrainer(Trainer):
             )
             * batch_loss,
             dim=1,
+            keepdim=True,
         )
         loss = 1.0 / batch_size * torch.sum(importance_sampling * weighted_batch_loss)
 
@@ -110,7 +113,8 @@ class Seq2SlateDifferentiableRewardTrainer(Trainer):
         loss = loss.detach().cpu().numpy()
         per_symbol_log_probs = per_symbol_log_probs.detach()
         self.minibatch += 1
-        logger.info(f"{self.minibatch} batch: loss={loss}")
+        if self.minibatch % self.print_interval == 0:
+            logger.info(f"{self.minibatch} batch: loss={loss}")
 
         return {"per_symbol_log_probs": per_symbol_log_probs, "sl": loss}
 

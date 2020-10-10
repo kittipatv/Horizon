@@ -1,0 +1,46 @@
+env:
+  Gym:
+    env_name: Pendulum-v0
+model:
+  TD3:
+    trainer_param:
+      rl:
+        gamma: 0.99
+        target_update_rate: 0.005
+      minibatch_size: 256
+      q_network_optimizer:
+        Adam:
+          lr: 0.01
+      actor_network_optimizer:
+        Adam:
+          lr: 0.005
+      noise_variance: 0.2
+      noise_clip: 0.5
+      delayed_policy_update: 2
+    actor_net_builder:
+      FullyConnected:
+        exploration_variance: 0.01
+        sizes:
+        - 64
+        - 64
+        activations:
+        - leaky_relu
+        - leaky_relu
+    critic_net_builder:
+      FullyConnected:
+        sizes:
+        - 64
+        - 64
+        activations:
+        - leaky_relu
+        - leaky_relu
+    eval_parameters:
+      calc_cpe_in_training: false
+replay_memory_size: 100000
+train_every_ts: 1
+train_after_ts: 5000
+num_train_episodes: 40
+num_eval_episodes: 20
+# Though maximal score is 0, we set lower bar to let tests finish in time
+passing_score_bar: -750
+use_gpu: false
